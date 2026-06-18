@@ -1,277 +1,202 @@
-# 代码讲解文档 — 核心模块逐行解析
+# 代码讲解文档 — 核心模块解析
 
-> 本文档对三语言实现的核心模块进行详细讲解，帮助你在面试中清晰地描述代码设计。
-
----
-
-## 1. Python实现核心讲解
-
-### 1.1 Supervisor编排 (supervisor.py)
-
-#### State定义 — 系统的"数据总线"
-
-```python
-class AgentState(TypedDict):
-    messages: Annotated[list[BaseMessage], add_messages]
-    user_id: str
-    session_id: str
-    intent: str
-    sub_results: dict[str, Any]
-    compliance_passed: bool
-    final_response: str
-    current_agent: str
-    retry_count: int
-```
-
-**设计要点**：
-- `Annotated[list[BaseMessage], add_messages]`：LangGraph的reducer机制。当多个节点向messages写入时，`add_messages`会自动追加而非覆盖
-- `sub_results`是一个dict：各Agent把结果写入不同key，避免互相覆盖
-- `compliance_passed`是布尔值：合规审查的结果，决定最终是否返回自动回复
-
-#### Graph构建 — 编排的核心
-
-```python
-graph = StateGraph(AgentState)
-
-# 添加节点（每个节点是一个异步函数）
-graph.add_node("supervisor_route", supervisor.route_decision)
-graph.add_node("knowledge_rag", knowledge_agent.process)
-graph.add_node("ticket_handler", ticket_agent.process)
-graph.add_node("compliance_check", compliance_agent.process)
-graph.add_node("synthesize", supervisor.synthesize_response)
-
-# 设置入口
-graph.set_entry_point("supervisor_route")
-
-# 条件边：根据意图路由到不同Agent
-graph.add_conditional_edges(
-    "supervisor_route",
-    route_to_agent,  # 路由函数
-    {
-        "knowledge_rag": "knowledge_rag",
-        "ticket_handler": "ticket_handler",
-        "compliance_check": "compliance_check",
-    },
-)
-
-# 固定边：所有业务Agent → 合规审查 → 汇总 → 结束
-graph.add_edge("knowledge_rag", "compliance_check")
-graph.add_edge("ticket_handler", "compliance_check")
-graph.add_edge("compliance_check", "synthesize")
-graph.add_edge("synthesize", END)
-```
-
-**设计模式**：
-- **条件路由**：`add_conditional_edges`根据运行时状态决定走哪条路径
-- **汇聚点**：`compliance_check`是汇聚节点，确保所有回复都经过审查
-- **Checkpoint**：`MemorySaver()`保存每步的State快照，支持断点恢复
-
-### 1.2 RAG知识检索 (knowledge_rag.py)
-
-#### 完整RAG流程
-
-```python
-async def process(self, state):
-    original_query = messages[-1].content
-    
-    # Step 1: Query改写（口语 → 检索友好）
-    rewritten_query = await self.rewrite_query(original_query)
-    
-    # Step 2: 向量检索（Top-5）
-    raw_docs = await self.retrieve_documents(rewritten_query, top_k=5)
-    
-    # Step 3: 重排序（Top-5 → Top-3）
-    reranked_docs = await self.rerank_documents(rewritten_query, raw_docs, top_k=3)
-    
-    # Step 4: 生成回答
-    answer = await self.generate_answer(original_query, reranked_docs)
-```
-
-**为什么先检索Top-5再排序到Top-3？**
-- 向量检索是**近似检索**，Top-5保证召回率
-- 重排序用LLM做更精确的相关性判断，从5筛到3提升精确率
-- 最终只注入3篇文档，控制Token消耗
-
-### 1.3 合规审查 (compliance_checker.py)
-
-#### 两阶段审查机制
-
-```python
-async def full_check(self, content: str) -> ComplianceResult:
-    # Phase 1: 规则引擎（毫秒级，零成本）
-    rule_result = await self.rule_check(content)
-    
-    # 高风险直接拦截，不走LLM
-    if not rule_result.passed and rule_result.risk_level in ("high", "critical"):
-        return rule_result
-    
-    # Phase 2: LLM深度审查（秒级，有API成本）
-    llm_result = await self.llm_check(content)
-    
-    # 合并两阶段结果
-    all_violations = rule_result.violations + llm_result.violations
-    final_passed = rule_result.passed and llm_result.passed
-```
-
-**设计要点**：
-- 规则引擎是**高召回率的快筛**：宁可多报不能漏报
-- LLM审查是**高精确率的精筛**：处理规则覆盖不了的场景
-- 高风险**直接拦截不走LLM**：既省成本又降延迟
-
-### 1.4 MCP工具协议 (mcp_server.py)
-
-#### 工具注册（装饰器模式）
-
-```python
-@server.register(
-    name="order_query",
-    description="查询订单信息",
-    input_schema={...},
-    category="order",
-)
-async def order_query(order_id: str = "") -> dict:
-    ...
-```
-
-#### JSON-RPC 2.0处理
-
-```python
-async def handle_jsonrpc(self, request: dict) -> dict:
-    method = request.get("method", "")
-    
-    if method == "tools/list":     # 工具发现
-        result = self.list_tools()
-    elif method == "tools/call":   # 工具调用
-        result = await self.call_tool(name, arguments)
-```
-
-**符合MCP规范的关键点**：
-- 使用`tools/list`和`tools/call`标准方法名
-- 请求/响应遵循JSON-RPC 2.0格式（jsonrpc/method/params/id/result/error）
-- 工具声明包含`inputSchema`用于参数校验
-
-### 1.5 OpenTelemetry追踪 (otel_config.py)
-
-#### 追踪装饰器
-
-```python
-def trace_agent_call(agent_name: str) -> Callable:
-    def decorator(func):
-        async def wrapper(*args, **kwargs):
-            with tracer.start_as_current_span(span_name) as span:
-                span.set_attribute("agent.name", agent_name)
-                start_time = time.time()
-                
-                result = await func(*args, **kwargs)
-                
-                span.set_attribute("agent.duration_ms", duration_ms)
-                span.set_attribute("agent.success", True)
-                return result
-```
-
-**设计模式**：装饰器模式 + AOP（面向切面编程）。业务代码完全不需要关心追踪逻辑，只需要加一行装饰器。
+> 本文档逐层讲解 Python 实现的核心模块，帮助快速理解代码设计。
 
 ---
 
-## 2. Java实现核心讲解
+## 1. 入口：FastAPI 应用 (`api/main.py`)
 
-### 2.1 Supervisor编排 (SupervisorAgent.java)
+### 1.1 应用生命周期
 
-```java
-public AgentState orchestrate(AgentState state) {
-    return tracer.trace("supervisor", "orchestrate", () -> {
-        // Step 1: 意图路由
-        AgentState routedState = intentRouter.process(state);
-        
-        // Step 2: 分发到子Agent
-        AgentState processedState = dispatchToAgent(routedState, intent);
-        
-        // Step 3: 合规审查
-        AgentState checkedState = complianceAgent.process(processedState);
-        
-        // Step 4: 汇总
-        return synthesize(checkedState);
-    });
-}
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. 初始化 OpenTelemetry 追踪
+    init_tracer(...)
+
+    # 2. 播种向量库文档（12篇电商知识文档）
+    for doc in ECOMMERCE_DOCUMENTS:
+        long_term_memory.add_document(content=doc["content"], source=doc["source"])
+
+    # 3. 构建知识图谱（60+实体、70+关系）
+    knowledge_graph.build_from_structured(
+        entities=ECOMMERCE_GRAPH_DATA["entities"],
+        relationships=ECOMMERCE_GRAPH_DATA["relationships"],
+    )
+
+    # 4. 构建 LangGraph 编排图
+    graph = create_supervisor_graph(
+        working_memory=working_memory,
+        short_term_memory=short_term_memory,
+        long_term_memory=long_term_memory,
+        knowledge_graph=knowledge_graph,
+    )
+    yield
 ```
 
-**Java特有设计**：
-- 使用`Supplier<T>`函数式接口传入追踪逻辑，实现类似Python装饰器的效果
-- `switch`表达式（Java 21）实现路由分发，比if-else更清晰
-- `ConcurrentHashMap`保证工单存储的线程安全
+启动时自动完成所有初始化，无需外部数据库。
 
-### 2.2 依赖注入（Spring IoC）
+### 1.2 路由端点
 
-```java
-@Component
-public class SupervisorAgent {
-    private final IntentRouterAgent intentRouter;
-    private final KnowledgeRAGAgent knowledgeAgent;
-    // ... 构造器注入
-}
-```
-
-所有Agent通过Spring容器管理，Supervisor通过构造器注入持有所有子Agent的引用。面试中可以讨论：为什么用构造器注入而不是@Autowired？（答：不可变性 + 必须依赖 + 更好的测试性）
+- `/api/chat` — 纯文本聊天。`ChatRequest` 入参 → `graph.ainvoke()` → `ChatResponse`
+- `/api/chat/multimodal` — 多模态聊天。`ChatMultiModalRequest` 包含 `images: list[str]`，预处理后调用同一 Graph
+- `/api/knowledge-graph/*` — 图谱查询、统计、构建
 
 ---
 
-## 3. Go实现核心讲解
+## 2. 编排核心 (`agents/supervisor.py`)
 
-### 3.1 并发设计
+### 2.1 StateGraph 拓扑
 
-```go
-func (s *SupervisorAgent) Orchestrate(state *State) *State {
-    // Go的goroutine可以轻松实现Agent并行调度
-    // 如果需要并行执行知识检索和合规审查：
-    
-    var wg sync.WaitGroup
-    wg.Add(2)
-    
-    go func() {
-        defer wg.Done()
-        state = s.knowledgeAgent.Process(state)
-    }()
-    
-    go func() {
-        defer wg.Done()
-        // 并行执行其他操作
-    }()
-    
-    wg.Wait()
-}
+```
+preprocess → supervisor_route ──→ knowledge_rag ──┐
+                    │          → ticket_handler ──┤
+                    │          → graph_rag ────────┤
+                    │          → vision ───────────┤
+                    │          → compliance_check ─┤
+                    │                              │
+                    └──────────  conditional_edges ┘
+                                    │
+                              compliance_check
+                                    │
+                                synthesize → END
 ```
 
-**Go的并发优势**：
-- goroutine创建成本极低（~2KB栈空间），可以为每个Agent请求创建goroutine
-- `sync.RWMutex`实现读写锁，工作记忆支持并发读、互斥写
-- channel可以用于Agent间异步消息传递
+### 2.2 preprocess 节点
 
-### 3.2 泛型追踪函数
+最简单但关键的节点：检测 `state.images` 是否为空，设 `has_images` 标志，供后续路由参考。
 
-```go
-func TraceFunc[T any](agentName, method string, fn func() T) T {
-    start := time.Now()
-    result := fn()
-    elapsed := time.Since(start)
-    RecordMetric(agentName, elapsed.Milliseconds(), true)
-    return result
-}
+```python
+async def preprocess_input(state: AgentState) -> AgentState:
+    images = state.get("images", [])
+    return {**state, "has_images": len(images) > 0}
 ```
 
-Go 1.18+的泛型让追踪函数可以适用于任何返回类型，类似Python的装饰器效果。
+### 2.3 路由决策
+
+`SupervisorNode.route_decision` 调用 LLM 分析用户意图，从 5 个可选 Agent 中选出最优目标。有图片时自动提升 vision 优先级。
+
+### 2.4 结果汇总
+
+`synthesize_response` 按照 vision → graph_rag → knowledge_rag → ticket 顺序合并输出，合规不通过则返回转人工话术。
 
 ---
 
-## 4. 设计模式总结
+## 3. 知识检索 (`agents/knowledge_rag.py`)
 
-| 模式 | 应用位置 | 说明 |
-|------|---------|------|
-| **策略模式** | 意图路由Agent | 不同意图使用不同的处理策略 |
-| **责任链模式** | 合规审查 | 规则引擎 → LLM审查，逐层过滤 |
-| **装饰器模式** | OpenTelemetry追踪 | 无侵入地添加追踪能力 |
-| **工厂模式** | MCP工具注册 | 统一的工具创建和注册接口 |
-| **状态模式** | 工单状态流转 | created → processing → resolved |
-| **观察者模式** | 全链路追踪 | Agent执行事件自动触发Span记录 |
-| **单例模式** | 记忆系统 | 工作记忆、短期记忆全局唯一实例 |
+四步标准 RAG 管线：
 
-面试时提到设计模式可以加分，但要结合具体场景说明为什么用这个模式，而不是为了用而用。
+```
+用户原始问题: "X1电池多大"
+    ↓
+[Query改写] → "X1智能手机 电池容量 mAh"
+    ↓
+[向量检索] FAISS.search → Top-5 相关文档
+    ↓
+[重排序]   LLM 评估相关性 → Top-3
+    ↓
+[生成回答] System Prompt + 文档 + 问题 → 回答
+```
+
+Query 改写将口语化问题转为检索友好格式，重排序利用 LLM 判断文档与问题的实际相关性。
+
+---
+
+## 4. 图谱推理 (`agents/graph_rag.py`)
+
+混合检索 = 向量语义匹配 + 图谱结构遍历。
+
+### 4.1 实体提取
+
+`extract_query_entities` 让 LLM 从用户问题中提取关键实体（商品名、品牌、品类等），返回 `[{"name": "X1", "type": "Product"}]`。
+
+### 4.2 图遍历
+
+`graph_traverse` 先调用 `KnowledgeGraph.search_entities()` 模糊匹配实体，再取 2-hop 邻居，生成 `get_subgraph_context()` 文本。
+
+### 4.3 上下文拼装
+
+```
+graph_context: "实体[X1手机] --[compatible_with]--> [65W充电器] ..."
+vector_docs:   ["X1手机配备5000mAh电池，支持65W快充..."]
+
+→ LLM 生成：结合结构化关系 + 文档细节的回答
+```
+
+---
+
+## 5. 视觉分析 (`agents/vision.py`)
+
+### 5.1 图片校验
+
+`validate_image_base64` 检查数据格式（magic bytes）、解码正确性、文件大小（<10MB）。
+
+### 5.2 多类型分析
+
+| analysis_type | 适用场景 | 提取内容 |
+|---------------|----------|----------|
+| screenshot | 报错截图、订单截图 | 错误信息、订单号、金额 |
+| invoice | 发票、收据 | 发票号、日期、金额、商家 |
+| product | 商品照片 | 品牌、型号、外观状态 |
+| delivery | 物流截图 | 快递单号、状态 |
+
+### 5.3 批量处理
+
+`process(state)` 遍历 `state.images`，每张图片调用 GPT-4o vision，汇总所有结果写入 `sub_results.vision`。
+
+---
+
+## 6. 知识图谱 (`memory/knowledge_graph.py`)
+
+### 6.1 数据模型
+
+```
+Node: {id, type(Product|Brand|Policy|...), name, properties}
+Edge: {source → target, type(compatible_with|applies_to|...), properties}
+```
+
+### 6.2 核心操作
+
+- `search_entities(query, type)` — 按名称模糊匹配，按匹配度排序
+- `get_neighbors(entity_id, hops)` — BFS 邻居遍历
+- `get_subgraph_context(entity_ids)` — 子图序列化为 LLM 可读文本
+- `find_paths(source, target)` — 两实体间路径查找
+- `build_from_documents(docs)` — LLM 自动提取实体关系
+
+### 6.3 持久化
+
+`save()` → JSON，`_load()` 从 JSON 恢复。预留 `GRAPH_BACKEND=neo4j` 升级路径。
+
+---
+
+## 7. 记忆系统
+
+| 记忆层 | 文件 | 存储 | 生命周期 |
+|--------|------|------|----------|
+| 工作记忆 | `working_memory.py` | 内存 dict | 单 Session |
+| 短期记忆 | `short_term.py` | Redis | TTL 30min |
+| 长期记忆 | `long_term.py` | FAISS 磁盘 | 永久 |
+| 知识图谱 | `knowledge_graph.py` | NetworkX/JSON | 永久 |
+
+---
+
+## 8. MCP 工具协议 (`mcp/mcp_server.py`)
+
+遵循 JSON-RPC 2.0 标准，提供 6 个工具：
+
+| 工具 | 分类 | 用途 |
+|------|------|------|
+| order_query | order | 查询订单信息 |
+| knowledge_search | knowledge | 搜索知识库 |
+| ticket_create | ticket | 创建工单 |
+| risk_check | compliance | 风控检查 |
+| graph_search | knowledge_graph | 图谱实体检索 |
+| graph_find_path | knowledge_graph | 实体路径查找 |
+| image_analysis | vision | 图片分析 |
+
+工具注册使用装饰器模式：
+
+```python
+@server.register(name="graph_search", ..., category="knowledge_graph")
+async def graph_search(entity_name, ...): ...
+```

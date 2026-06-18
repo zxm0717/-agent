@@ -1,107 +1,130 @@
 # 部署指南
 
-## 1. 本地开发环境
+## 1. 环境要求
 
-### Python版本
+| 依赖 | 版本 | 说明 |
+|------|------|------|
+| Python | 3.11+ | 运行环境 |
+| Redis | 7.x | 短期记忆存储（可选，不装则用内存回退） |
+| Docker | 24+ | 容器化部署（可选） |
+
+---
+
+## 2. 本地开发
+
+### 2.1 安装依赖
 
 ```bash
 cd python-impl
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+source venv/bin/activate    # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+```
+
+### 2.2 配置环境变量
+
+```bash
 cp .env.example .env
-# 编辑 .env 填入你的API Key
-python -m api.main
 ```
 
-访问: http://localhost:8000/docs (Swagger UI)
+编辑 `.env`，填入必要配置：
 
-### Java版本
+```ini
+OPENAI_API_KEY=sk-your-key       # 必填
+MODEL_NAME=gpt-4o                # 默认即可
+REDIS_URL=redis://localhost:6379/0  # 可选，不填则使用内存回退
+GRAPH_STORE_PATH=./graph_store/graph.json
+```
+
+### 2.3 启动
 
 ```bash
-cd java-impl
-mvn clean package -DskipTests
-java -jar target/smart-cs-agent-1.0.0.jar
+python api/main.py
+# 或
+uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-访问: http://localhost:8080/api/health
+访问 `http://localhost:8000/health` 验证启动成功。
 
-### Go版本
+---
+
+## 3. Docker 部署
 
 ```bash
-cd go-impl
-go mod tidy
-go run main.go
+# 在项目根目录
+docker compose up -d
 ```
 
-访问: http://localhost:8090/health
+启动 3 个服务：
 
-## 2. Docker部署
+| 服务 | 端口 | 说明 |
+|------|------|------|
+| python-agent | 8000 | FastAPI 应用 |
+| redis | 6379 | 短期记忆 |
+| jaeger | 16686 | 追踪可视化 |
 
-### 单服务启动
+查看日志：
 
 ```bash
-# Python
-cd python-impl
-docker build -t smart-cs-python .
-docker run -p 8000:8000 --env-file .env smart-cs-python
-
-# Java
-cd java-impl
-mvn clean package -DskipTests
-docker build -t smart-cs-java .
-docker run -p 8080:8080 -e OPENAI_API_KEY=xxx smart-cs-java
-
-# Go
-cd go-impl
-docker build -t smart-cs-go .
-docker run -p 8090:8090 smart-cs-go
+docker compose logs -f python-agent
 ```
 
-### Docker Compose 一键启动
+停止：
 
 ```bash
-docker-compose up -d
+docker compose down
 ```
 
-## 3. API接口说明
+---
 
-所有三个版本提供统一的REST API：
+## 4. 验证
 
-### POST /api/chat — 聊天接口
+### 4.1 健康检查
 
-```json
-// Request
-{
-  "message": "我想了解一下理财产品A",
-  "user_id": "user_001",
-  "session_id": "optional-session-id"
-}
-
-// Response
-{
-  "response": "关于理财产品A...",
-  "session_id": "xxx",
-  "intent": "knowledge_rag",
-  "compliance_passed": true
-}
+```bash
+curl http://localhost:8000/health
+# {"status": "healthy", "version": "2.0.0"}
 ```
 
-### GET /api/history/{session_id} — 对话历史
+### 4.2 文本聊天
 
-### GET /api/tools — MCP工具列表
+```bash
+curl -X POST http://localhost:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "X1手机支持哪些配件？", "user_id": "test"}'
+```
 
-### GET /api/metrics — 系统指标
+### 4.3 知识图谱查询
 
-### GET /health — 健康检查
+```bash
+curl "http://localhost:8000/api/knowledge-graph/query?entity=X1"
+curl "http://localhost:8000/api/knowledge-graph/stats"
+```
 
-## 4. 环境变量说明
+### 4.4 多模态聊天
 
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| OPENAI_API_KEY | LLM API密钥 | 无 |
-| OPENAI_BASE_URL | API端点 | https://api.openai.com/v1 |
-| MODEL_NAME | 模型名称 | gpt-4o |
-| REDIS_URL | Redis地址 | redis://localhost:6379/0 |
-| OTEL_SERVICE_NAME | 追踪服务名 | smart-cs-multi-agent |
-| OTEL_EXPORTER_OTLP_ENDPOINT | OTLP端点 | http://localhost:4317 |
+```bash
+curl -X POST http://localhost:8000/api/chat/multimodal \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "这张截图里有什么错误？",
+    "user_id": "test",
+    "images": ["<base64图片数据>"]
+  }'
+```
+
+---
+
+## 5. 常见问题
+
+### Redis 连接失败
+
+不装 Redis 时系统自动降级为内存存储（`ShortTermMemory` 使用 `_fallback_store`），不影响功能但重启后对话历史丢失。
+
+### FAISS 未安装
+
+部分 Windows 环境下 `faiss-cpu` 安装可能失败。`LongTermMemory` 会自动回退到关键词匹配搜索。
+
+### 图片分析无响应
+
+Vision 功能依赖 GPT-4o 多模态能力，确保 `MODEL_NAME` 配置为支持视觉的模型。
