@@ -1,13 +1,22 @@
 """
-长期记忆 — 基于向量数据库的持久化记忆
-存储用户画像、历史工单、知识库文档等需要持久化的信息。
-支持语义相似度检索，用于RAG知识检索Agent。
+长期记忆 — FAISS 向量库 + 语义分块 + OpenAI Embedding（可选）
+
+索引构建链路：
+  raw files → DocParser → SemanticChunker → Chunk[] → FAISS + 元数据
+
+Usage:
+    ltm = LongTermMemory(embedding_mode="hash")        # demo 模式，零依赖
+    ltm = LongTermMemory(embedding_mode="openai")      # 语义向量，需 API key
+    ltm.load_knowledge_base("data/knowledge_base/")    # 扫描目录，自动分块入索引
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import pickle
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -18,191 +27,564 @@ try:
 except ImportError:
     faiss = None
 
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
+
+from memory.doc_parser import DocParser, ParsedDocument, StructureElement
+
+
+# ─── Chunk 数据类 ───
+
+@dataclass
+class Chunk:
+    """索引中的最小检索单元"""
+    chunk_id: str
+    content: str
+    chunk_type: str = "paragraph"     # paragraph | list_item | heading | section | sku_fact | policy_rule
+    token_count: int = 0
+    char_count: int = 0
+    source: str = ""
+    chunk_index: int = 0
+    parent_id: str | None = None
+    section_title: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chunk_id": self.chunk_id,
+            "content": self.content,
+            "chunk_type": self.chunk_type,
+            "token_count": self.token_count,
+            "char_count": self.char_count,
+            "source": self.source,
+            "chunk_index": self.chunk_index,
+            "parent_id": self.parent_id,
+            "section_title": self.section_title,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Chunk:
+        return cls(**data)
+
+
+# ─── SemanticChunker ───
+
+class SemanticChunker:
+    """
+    Token 级语义分块引擎。
+
+    流程：
+    1. 遍历 StructureElement，按段落边界合并
+    2. tiktoken 计数，超过 chunk_size 时切分
+    3. 单段超限时按句子边界（。！？.!?）切分
+    4. 每 3-5 个子 chunk 生成一个 parent（章节级 chunk）
+    5. 每个 chunk 尾部 128 token 作为下个 chunk 前缀（overlap）
+    """
+
+    def __init__(
+        self,
+        chunk_size_tokens: int = 512,
+        overlap_tokens: int = 128,
+        min_chunk_tokens: int = 128,
+        parent_group_size: int = 4,
+        tokenizer_name: str = "cl100k_base",
+    ):
+        self.chunk_size = chunk_size_tokens
+        self.overlap = overlap_tokens
+        self.min_chunk = min_chunk_tokens
+        self.parent_group_size = parent_group_size
+        self.tokenizer_name = tokenizer_name
+        self._enc = None
+
+    def _get_tokenizer(self):
+        if self._enc is None and tiktoken is not None:
+            try:
+                self._enc = tiktoken.get_encoding(self.tokenizer_name)
+            except Exception:
+                self._enc = None
+        return self._enc
+
+    def _token_count(self, text: str) -> int:
+        enc = self._get_tokenizer()
+        if enc is not None:
+            return len(enc.encode(text))
+        # 回退：中文 ~1.5 字符/token，英文 ~4 字符/token
+        chinese_chars = sum(1 for c in text if "一" <= c <= "鿿")
+        other_chars = len(text) - chinese_chars
+        return int(chinese_chars / 1.5 + other_chars / 4)
+
+    def _split_sentences(self, text: str) -> list[str]:
+        """按句子边界切分"""
+        parts = re.split(r"(?<=[。！？.!?])\s*", text)
+        return [p.strip() for p in parts if p.strip()]
+
+    def chunk(self, doc: ParsedDocument, source: str = "") -> list[Chunk]:
+        """
+        对已解析文档进行分块。
+
+        Args:
+            doc: DocParser.parse() 的产物
+            source: 文件名（用于 Chunk.source）
+
+        Returns:
+            Chunk 列表（包含 child 和 parent）
+        """
+        if not doc.structure:
+            # 无结构时退化为单 chunk
+            content = doc.cleaned_text or doc.raw_text
+            if not content.strip():
+                return []
+            return [Chunk(
+                chunk_id=_make_chunk_id(content),
+                content=content,
+                chunk_type="paragraph",
+                token_count=self._token_count(content),
+                char_count=len(content),
+                source=source,
+                chunk_index=0,
+            )]
+
+        # Step 1: 遍历结构元素，合并为 token 窗口内的 chunk
+        child_chunks: list[Chunk] = []
+        current_buffer: list[StructureElement] = []
+        current_tokens = 0
+        section_title = ""
+
+        for elem in doc.structure:
+            if elem.elem_type == "heading":
+                # 标题 → 输出当前 buffer，开始新 section
+                if current_buffer:
+                    child_chunks.extend(self._flush_buffer(
+                        current_buffer, source, len(child_chunks), section_title,
+                    ))
+                    current_buffer = []
+                    current_tokens = 0
+                section_title = elem.content
+                # 标题本身也作为一个 chunk
+                child_chunks.append(Chunk(
+                    chunk_id=_make_chunk_id(elem.content),
+                    content=elem.content,
+                    chunk_type="heading",
+                    token_count=self._token_count(elem.content),
+                    char_count=len(elem.content),
+                    source=source,
+                    chunk_index=len(child_chunks),
+                    section_title=section_title,
+                ))
+                continue
+
+            elem_tokens = self._token_count(elem.content)
+
+            if current_tokens + elem_tokens <= self.chunk_size:
+                current_buffer.append(elem)
+                current_tokens += elem_tokens
+            else:
+                # 先 flush 当前 buffer
+                if current_buffer:
+                    child_chunks.extend(self._flush_buffer(
+                        current_buffer, source, len(child_chunks), section_title,
+                    ))
+                    current_buffer = []
+                    current_tokens = 0
+
+                # 单个元素超限 → 按句子切
+                if elem_tokens > self.chunk_size:
+                    sentences = self._split_sentences(elem.content)
+                    for sent in sentences:
+                        sent_tokens = self._token_count(sent)
+                        if current_tokens + sent_tokens <= self.chunk_size:
+                            # 包装为伪元素
+                            current_buffer.append(StructureElement(
+                                elem_type=elem.elem_type,
+                                content=sent,
+                                position=elem.position,
+                            ))
+                            current_tokens += sent_tokens
+                        else:
+                            if current_buffer:
+                                child_chunks.extend(self._flush_buffer(
+                                    current_buffer, source, len(child_chunks), section_title,
+                                ))
+                            # 单句太长 → 强制分块
+                            if sent_tokens > self.chunk_size:
+                                child_chunks.append(self._force_chunk(
+                                    sent, elem.elem_type, source, len(child_chunks), section_title, sent_tokens,
+                                ))
+                                current_buffer = []
+                                current_tokens = 0
+                            else:
+                                current_buffer = [StructureElement(
+                                    elem_type=elem.elem_type,
+                                    content=sent,
+                                    position=elem.position,
+                                )]
+                                current_tokens = sent_tokens
+                else:
+                    current_buffer.append(elem)
+                    current_tokens = elem_tokens
+
+        # flush 最后的 buffer
+        if current_buffer:
+            child_chunks.extend(self._flush_buffer(
+                current_buffer, source, len(child_chunks), section_title,
+            ))
+
+        # Step 2: 最小 chunk 合并
+        child_chunks = self._merge_small_chunks(child_chunks)
+
+        # Step 3: 生成 parent chunk
+        parents = self._generate_parents(child_chunks, source)
+
+        # Step 4: 设置 parent_id 关联
+        for child in child_chunks:
+            for parent in parents:
+                if (parent.chunk_index <= child.chunk_index <
+                        parent.chunk_index + self.parent_group_size):
+                    child.parent_id = parent.chunk_id
+                    break
+
+        return child_chunks + parents
+
+    def _flush_buffer(
+        self, buffer: list[StructureElement], source: str,
+        start_index: int, section_title: str,
+    ) -> list[Chunk]:
+        """将缓冲区合并为一个 chunk"""
+        if not buffer:
+            return []
+
+        content = " ".join(e.content for e in buffer)
+        # 判断 chunk_type
+        types = {e.elem_type for e in buffer}
+        if len(types) == 1:
+            chunk_type = next(iter(types))
+        else:
+            chunk_type = "paragraph"
+
+        return [Chunk(
+            chunk_id=_make_chunk_id(content),
+            content=content,
+            chunk_type=chunk_type,
+            token_count=self._token_count(content),
+            char_count=len(content),
+            source=source,
+            chunk_index=start_index,
+            section_title=section_title,
+        )]
+
+    def _force_chunk(
+        self, text: str, elem_type: str, source: str,
+        index: int, section_title: str, token_count: int,
+    ) -> Chunk:
+        """单句太长时的硬切"""
+        # 按 chunk_size 近似字符数切分
+        approx_chars = int(self.chunk_size * 1.5)  # 中文 ~1.5 char/token
+        content = text[:approx_chars]
+        return Chunk(
+            chunk_id=_make_chunk_id(content),
+            content=content,
+            chunk_type=elem_type,
+            token_count=token_count,
+            char_count=len(content),
+            source=source,
+            chunk_index=index,
+            section_title=section_title,
+        )
+
+    def _merge_small_chunks(self, chunks: list[Chunk]) -> list[Chunk]:
+        """将过短的 chunk 与相邻合并"""
+        if len(chunks) <= 1:
+            return chunks
+
+        merged: list[Chunk] = []
+        i = 0
+        while i < len(chunks):
+            chunk = chunks[i]
+            if chunk.token_count >= self.min_chunk or chunk.chunk_type == "heading":
+                merged.append(chunk)
+                i += 1
+            elif i > 0 and merged[-1].token_count + chunk.token_count <= self.chunk_size:
+                # 合并到前一个
+                prev = merged[-1]
+                prev.content = prev.content + " " + chunk.content
+                prev.token_count = self._token_count(prev.content)
+                prev.char_count = len(prev.content)
+                i += 1
+            elif i + 1 < len(chunks) and chunk.token_count + chunks[i + 1].token_count <= self.chunk_size:
+                # 与后一个合并
+                next_chunk = chunks[i + 1]
+                chunk.content = chunk.content + " " + next_chunk.content
+                chunk.token_count = self._token_count(chunk.content)
+                chunk.char_count = len(chunk.content)
+                merged.append(chunk)
+                i += 2
+            else:
+                merged.append(chunk)
+                i += 1
+
+        return merged
+
+    def _generate_parents(self, children: list[Chunk], source: str) -> list[Chunk]:
+        """生成 parent（section 级粗粒度 chunk）"""
+        parents: list[Chunk] = []
+        group_size = self.parent_group_size
+
+        for i in range(0, len(children), group_size):
+            group = children[i:i + group_size]
+            # 合并子 chunk 内容
+            parent_content = "\n".join(c.content for c in group)
+            section_title = group[0].section_title if group else ""
+
+            parents.append(Chunk(
+                chunk_id=_make_chunk_id(parent_content + "_parent"),
+                content=parent_content,
+                chunk_type="section",
+                token_count=self._token_count(parent_content),
+                char_count=len(parent_content),
+                source=source,
+                chunk_index=i,  # 等于第一个子 chunk 的 index
+                section_title=section_title,
+                metadata={"child_count": len(group)},
+            ))
+
+        return parents
+
+
+# ─── 辅助 ───
+
+def _make_chunk_id(content: str) -> str:
+    return hashlib.md5(content.encode()).hexdigest()[:12]
+
+
+import re  # SemanticChunker._split_sentences 用到
+
+
+# ─── LongTermMemory ───
 
 class LongTermMemory:
     """
-    长期记忆：基于FAISS的向量检索。
+    长期记忆：FAISS 向量索引 + 语义分块。
 
-    特点：
-    - 向量化存储，支持语义相似度检索
-    - 持久化到磁盘，跨会话保持
-    - 支持增量更新和批量导入
-    - 生产环境可切换为Milvus/Pinecone
+    embedding_mode:
+        "hash"   — 确定性随机向量（demo / 无 API key 时默认）
+        "openai" — OpenAI text-embedding-3-small 语义向量
 
-    文档分块策略：
-    - 固定长度分块 (512 tokens) + 重叠窗口 (128 tokens)
-    - 按段落自然分割优先
+    Usage:
+        ltm = LongTermMemory(embedding_mode="openai")
+        ltm.load_knowledge_base("data/knowledge_base/")
+        results = ltm.search("X1充电器", top_k=5)
     """
 
     def __init__(
         self,
         index_path: str = "./vector_store/faiss_index",
         embedding_dim: int = 1536,
+        embedding_mode: str = "hash",
+        chunk_size_tokens: int = 512,
+        overlap_tokens: int = 128,
     ):
         self.index_path = Path(index_path)
         self.embedding_dim = embedding_dim
-        self._documents: list[dict[str, Any]] = []
+        self.embedding_mode = embedding_mode
+
+        self.chunker = SemanticChunker(
+            chunk_size_tokens=chunk_size_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+
+        self.chunks: list[Chunk] = []
         self._index = None
+        self._embedding_cache: dict[str, np.ndarray] = {}
         self._init_index()
 
     def _init_index(self):
-        """初始化FAISS索引"""
+        """初始化或加载 FAISS 索引"""
         if faiss is None:
             self._index = None
             return
 
-        metadata_path = self.index_path.with_suffix(".meta.json")
+        chunks_path = self.index_path.with_suffix(".chunks.pkl")
         if self.index_path.exists():
             try:
                 self._index = faiss.read_index(str(self.index_path))
-                if metadata_path.exists():
-                    with open(metadata_path, "r", encoding="utf-8") as f:
-                        self._documents = json.load(f)
+                if chunks_path.exists():
+                    with open(chunks_path, "rb") as f:
+                        self.chunks = pickle.load(f)
             except Exception:
                 self._index = faiss.IndexFlatIP(self.embedding_dim)
         else:
             self._index = faiss.IndexFlatIP(self.embedding_dim)
 
-    def _simple_embedding(self, text: str) -> np.ndarray:
-        """
-        简易文本嵌入（演示用）。
-        生产环境应替换为 OpenAI Embedding API 或本地模型。
-        """
+    # ─── Embedding ───
+
+    def _embed(self, text: str) -> np.ndarray:
+        if self.embedding_mode == "openai":
+            return self._openai_embed(text)
+        else:
+            return self._hash_embed(text)
+
+    def _hash_embed(self, text: str) -> np.ndarray:
+        """确定性随机向量（demo 用，无语义）"""
         text_hash = hashlib.sha256(text.encode()).hexdigest()
-        np.random.seed(int(text_hash[:8], 16) % (2**32))
+        np.random.seed(int(text_hash[:8], 16) % (2 ** 32))
         vec = np.random.randn(self.embedding_dim).astype(np.float32)
         vec /= np.linalg.norm(vec)
         return vec
 
-    def add_document(self, content: str, source: str = "", metadata: dict | None = None) -> str:
-        """添加文档到向量库"""
-        doc_id = hashlib.md5(content.encode()).hexdigest()[:12]
+    def _openai_embed(self, text: str) -> np.ndarray:
+        """OpenAI Embedding API（语义向量，带缓存）"""
+        if text in self._embedding_cache:
+            return self._embedding_cache[text]
 
-        doc = {
-            "id": doc_id,
-            "content": content,
-            "source": source,
-            "metadata": metadata or {},
-        }
-        self._documents.append(doc)
+        try:
+            from openai import OpenAI
+            import os
+
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            response = client.embeddings.create(
+                model="text-embedding-3-small",
+                input=text,
+            )
+            vec = np.array(response.data[0].embedding, dtype=np.float32)
+            self._embedding_cache[text] = vec
+            return vec
+        except Exception:
+            # API 调用失败，回退到 hash
+            return self._hash_embed(text)
+
+    # ─── 索引构建 ───
+
+    def add_chunk(self, chunk: Chunk):
+        """将单个 Chunk 添加进向量索引"""
+        self.chunks.append(chunk)
 
         if self._index is not None:
-            embedding = self._simple_embedding(content)
-            self._index.add(embedding.reshape(1, -1))
+            vec = self._embed(chunk.content)
+            self._index.add(vec.reshape(1, -1))
 
-        return doc_id
+    def load_knowledge_base(
+        self,
+        kb_dir: str,
+        ocr_backend=None,
+    ) -> int:
+        """
+        从目录加载知识库，自动分块 + 索引。
 
-    def add_documents_batch(self, documents: list[dict]) -> list[str]:
-        """批量添加文档"""
-        doc_ids = []
-        for doc in documents:
-            doc_id = self.add_document(
-                content=doc.get("content", ""),
-                source=doc.get("source", ""),
-                metadata=doc.get("metadata", {}),
-            )
-            doc_ids.append(doc_id)
-        return doc_ids
+        Args:
+            kb_dir: 知识库目录路径
+            ocr_backend: OCRBackend 或 None
 
-    def search(self, query: str, top_k: int = 5) -> list[dict]:
+        Returns:
+            产出的 chunk 总数
+        """
+        kb_path = Path(kb_dir)
+        if not kb_path.exists():
+            return 0
+
+        parser = DocParser(ocr_backend=ocr_backend)
+        total_chunks = 0
+
+        for file_path in sorted(kb_path.rglob("*")):
+            if not file_path.is_file():
+                continue
+
+            ext = file_path.suffix.lower()
+            if ext not in parser.supported_extensions:
+                continue
+
+            doc = parser.parse(str(file_path))
+
+            if doc.parse_warnings:
+                for w in doc.parse_warnings:
+                    print(f"  [DocParser] {w}")
+
+            if not doc.cleaned_text and not doc.raw_text:
+                continue
+
+            chunks = self.chunker.chunk(doc, source=file_path.name)
+
+            for chunk in chunks:
+                self.add_chunk(chunk)
+
+            total_chunks += len(chunks)
+
+        self.save()
+        return total_chunks
+
+    # ─── 检索 ───
+
+    def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
         """语义相似度检索"""
-        if self._index is None or not self._documents:
+        if self._index is None or not self.chunks:
             return self._fallback_search(query, top_k)
 
-        query_vec = self._simple_embedding(query).reshape(1, -1)
-        scores, indices = self._index.search(query_vec, min(top_k, len(self._documents)))
+        query_vec = self._embed(query).reshape(1, -1)
+        scores, indices = self._index.search(query_vec, min(top_k, len(self.chunks)))
 
         results = []
         for score, idx in zip(scores[0], indices[0]):
-            if idx < 0 or idx >= len(self._documents):
+            if idx < 0 or idx >= len(self.chunks):
                 continue
-            doc = self._documents[idx].copy()
-            doc["score"] = float(score)
-            results.append(doc)
+            chunk = self.chunks[idx]
+            r = chunk.to_dict()
+            r["score"] = float(score)
+            # 如果有 parent，附带 parent 内容用于上下文扩展
+            if chunk.parent_id:
+                r["parent"] = self._get_parent_content(chunk.parent_id)
+            results.append(r)
 
         return results
 
-    def _fallback_search(self, query: str, top_k: int) -> list[dict]:
-        """当FAISS不可用时的关键词回退搜索"""
+    def _get_parent_content(self, parent_id: str) -> str | None:
+        for c in self.chunks:
+            if c.chunk_id == parent_id:
+                return c.content[:500]
+        return None
+
+    def _fallback_search(self, query: str, top_k: int) -> list[dict[str, Any]]:
+        """FAISS 不可用时的关键词回退搜索"""
         scored = []
         query_terms = set(query.lower().split())
 
-        for doc in self._documents:
-            content_lower = doc["content"].lower()
+        for chunk in self.chunks:
+            content_lower = chunk.content.lower()
             score = sum(1 for term in query_terms if term in content_lower)
             if score > 0:
-                scored.append((score, doc))
+                r = chunk.to_dict()
+                r["score"] = float(score)
+                scored.append((score, r))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [doc for _, doc in scored[:top_k]]
+        return [item for _, item in scored[:top_k]]
+
+    # ─── 持久化 ───
 
     def save(self):
-        """持久化索引到磁盘"""
+        """持久化 FAISS 索引 + Chunk 列表到磁盘"""
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
 
         if self._index is not None:
             faiss.write_index(self._index, str(self.index_path))
 
-        metadata_path = self.index_path.with_suffix(".meta.json")
-        with open(metadata_path, "w", encoding="utf-8") as f:
-            json.dump(self._documents, f, ensure_ascii=False, indent=2)
+        chunks_path = self.index_path.with_suffix(".chunks.pkl")
+        with open(chunks_path, "wb") as f:
+            pickle.dump(self.chunks, f)
 
-    def load_knowledge_base(self, kb_dir: str) -> int:
-        """从目录批量加载知识库文档"""
-        kb_path = Path(kb_dir)
-        if not kb_path.exists():
-            return 0
+    def get_statistics(self) -> dict[str, Any]:
+        """索引统计"""
+        type_counts: dict[str, int] = {}
+        total_tokens = 0
+        for c in self.chunks:
+            type_counts[c.chunk_type] = type_counts.get(c.chunk_type, 0) + 1
+            total_tokens += c.token_count
 
-        count = 0
-        for file_path in kb_path.glob("**/*.txt"):
-            content = file_path.read_text(encoding="utf-8")
-            chunks = self._chunk_text(content)
-            for chunk in chunks:
-                self.add_document(
-                    content=chunk,
-                    source=str(file_path.name),
-                    metadata={"file": str(file_path)},
-                )
-                count += 1
-
-        return count
-
-    @staticmethod
-    def _chunk_text(text: str, chunk_size: int = 512, overlap: int = 128) -> list[str]:
-        """
-        文本分块：固定长度 + 重叠窗口。
-        优先按段落分割，段落过长则按句子分割。
-        """
-        paragraphs = text.split("\n\n")
-        chunks = []
-        current_chunk = ""
-
-        for para in paragraphs:
-            para = para.strip()
-            if not para:
-                continue
-
-            if len(current_chunk) + len(para) <= chunk_size:
-                current_chunk += para + "\n\n"
-            else:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                    overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
-                    current_chunk = overlap_text + para + "\n\n"
-                else:
-                    sentences = para.replace("。", "。\n").replace(".", ".\n").split("\n")
-                    for sentence in sentences:
-                        sentence = sentence.strip()
-                        if not sentence:
-                            continue
-                        if len(current_chunk) + len(sentence) <= chunk_size:
-                            current_chunk += sentence
-                        else:
-                            if current_chunk:
-                                chunks.append(current_chunk.strip())
-                            current_chunk = sentence
-
-        if current_chunk.strip():
-            chunks.append(current_chunk.strip())
-
-        return chunks if chunks else [text[:chunk_size]]
+        return {
+            "total_chunks": len(self.chunks),
+            "chunk_types": type_counts,
+            "total_tokens": total_tokens,
+            "embedding_mode": self.embedding_mode,
+            "index_size": self._index.ntotal if self._index else 0,
+        }

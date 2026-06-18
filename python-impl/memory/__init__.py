@@ -1,6 +1,25 @@
 from memory.working_memory import WorkingMemory
 from memory.short_term import ShortTermMemory
-from memory.long_term import LongTermMemory
+from memory.long_term import LongTermMemory, Chunk, SemanticChunker
 from memory.knowledge_graph import KnowledgeGraph
+from memory.doc_parser import DocParser, ParsedDocument, StructureElement
+from memory.ocr import OCRBackend, OpenAIVisionBackend, PaddleOCRBackend
+from memory.sparse_index import SparseIndex
+from memory.structured_encoder import StructuredEncoder
 
-__all__ = ["WorkingMemory", "ShortTermMemory", "LongTermMemory", "KnowledgeGraph"]
+__all__ = [
+    "WorkingMemory",
+    "ShortTermMemory",
+    "LongTermMemory",
+    "Chunk",
+    "SemanticChunker",
+    "KnowledgeGraph",
+    "DocParser",
+    "ParsedDocument",
+    "StructureElement",
+    "OCRBackend",
+    "OpenAIVisionBackend",
+    "PaddleOCRBackend",
+    "SparseIndex",
+    "StructuredEncoder",
+]

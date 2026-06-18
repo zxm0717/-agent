@@ -22,6 +22,8 @@ from memory.working_memory import WorkingMemory
 from memory.short_term import ShortTermMemory
 from memory.long_term import LongTermMemory
 from memory.knowledge_graph import KnowledgeGraph
+from memory.sparse_index import SparseIndex
+from memory.structured_encoder import StructuredEncoder
 from mcp.mcp_server import MCPToolServer, create_default_tools
 from tracing.otel_config import init_tracer, AgentMetrics
 
@@ -42,7 +44,11 @@ load_dotenv()
 
 working_memory = WorkingMemory()
 short_term_memory = ShortTermMemory(redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
-long_term_memory = LongTermMemory(index_path=os.getenv("FAISS_INDEX_PATH", "./vector_store/faiss_index"))
+long_term_memory = LongTermMemory(
+    index_path=os.getenv("FAISS_INDEX_PATH", "./vector_store/faiss_index"),
+    embedding_mode=os.getenv("EMBEDDING_MODE", "hash"),  # "hash" 或 "openai"
+)
+sparse_index = None  # 在 lifespan 中初始化
 knowledge_graph = KnowledgeGraph(
     persist_path=os.getenv("GRAPH_STORE_PATH", "./graph_store/graph.json"),
 )
@@ -190,9 +196,36 @@ async def lifespan(app: FastAPI):
         otlp_endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
     )
 
-    # 从 data/knowledge_base/ 加载文档，自动分块索引
+    # 从 data/knowledge_base/ 加载文档，自动解析 + 语义分块 + 向量索引
     chunk_count = long_term_memory.load_knowledge_base(KNOWLEDGE_BASE_DIR)
-    print(f"[init] 向量库已加载 {chunk_count} 个文档块")
+    print(f"[init] 向量索引: {chunk_count} chunks (embedding={long_term_memory.embedding_mode})")
+
+    # 构建 BM25 稀疏关键词索引
+    global sparse_index
+    sparse_index = SparseIndex()
+    sparse_index.index_chunks(long_term_memory.chunks)
+    print(f"[init] BM25 索引: {sparse_index._doc_count} docs, {len(sparse_index._inverted)} terms")
+
+    # 结构化数据编码后追加入索引
+    enc = StructuredEncoder()
+    sku_chunk = enc.encode_sku(
+        "星耀X1", {"storage": "256GB", "price": 4299, "color": "曜石黑"}, "标准版"
+    )
+    long_term_memory.add_chunk(sku_chunk)
+    sparse_index.index_chunk(sku_chunk)
+    encoded_count = 1
+
+    # 编码价格梯度
+    price_chunk = enc.encode_price_tier("星耀X1", [
+        {"label": "256GB", "price": 4299, "entity_id": "x1_phone"},
+        {"label": "512GB", "price": 5299, "entity_id": "x1_phone"},
+        {"label": "1TB", "price": 6299, "entity_id": "x1_phone"},
+    ])
+    long_term_memory.add_chunk(price_chunk)
+    sparse_index.index_chunk(price_chunk)
+    encoded_count += 1
+
+    print(f"[init] 结构化编码: {encoded_count} chunks")
 
     # 构建知识图谱（结构化数据）
     knowledge_graph.build_from_structured(
