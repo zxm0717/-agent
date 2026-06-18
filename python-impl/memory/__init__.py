@@ -6,6 +6,7 @@ from memory.doc_parser import DocParser, ParsedDocument, StructureElement
 from memory.ocr import OCRBackend, OpenAIVisionBackend, PaddleOCRBackend
 from memory.sparse_index import SparseIndex
 from memory.structured_encoder import StructuredEncoder
+from memory.retriever import HybridRetriever, QueryAnalysis, RetrievalResult
 
 __all__ = [
     "WorkingMemory",
@@ -22,4 +23,7 @@ __all__ = [
     "PaddleOCRBackend",
     "SparseIndex",
     "StructuredEncoder",
+    "HybridRetriever",
+    "QueryAnalysis",
+    "RetrievalResult",
 ]

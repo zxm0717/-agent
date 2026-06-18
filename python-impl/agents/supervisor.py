@@ -1,9 +1,13 @@
 """
-Supervisor编排Agent — 中央协调者
-负责接收用户请求，根据意图路由到对应子Agent，汇总结果返回。
-采用LangGraph StateGraph实现，支持并行调度和Human-in-the-Loop断点。
+Supervisor编排Agent — 中央协调者（v3: 多路并行）
 
-v2: 新增 GraphRAG Agent + Vision Agent 支持。
+负责接收用户请求，根据意图并行调度多个子Agent，汇总结果返回。
+采用LangGraph StateGraph + Send API 实现多路并行 fan-out。
+
+v3 变更：
+  - 单路由 → 多路并行（knowledge_rag ∥ graph_rag）
+  - sub_results 增加 merge reducer 支持并行结果合并
+  - synthesize_response 做去重/互补融合
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.types import Send
 from langgraph.checkpoint.memory import MemorySaver
 
 from agents.intent_router import IntentRouterAgent
@@ -25,9 +30,20 @@ from agents.graph_rag import GraphRAGAgent
 from agents.vision import VisionAgent
 from memory.working_memory import WorkingMemory
 from memory.short_term import ShortTermMemory
-from memory.long_term import LongTermMemory
 from memory.knowledge_graph import KnowledgeGraph
+from memory.retriever import HybridRetriever
 from tracing.otel_config import trace_agent_call
+
+
+# ─── Reducer: 并行节点 sub_results 合并 ───
+
+def _merge_sub_results(left: dict | None, right: dict | None) -> dict[str, Any]:
+    """合并两个并行节点的 sub_results，后到的覆盖同 key"""
+    if left is None:
+        return right or {}
+    if right is None:
+        return left
+    return {**left, **right}
 
 
 # ─── 状态定义 ───
@@ -38,12 +54,11 @@ class AgentState(TypedDict):
     user_id: str
     session_id: str
     intent: str
-    sub_results: dict[str, Any]
+    sub_results: Annotated[dict[str, Any], _merge_sub_results]
     compliance_passed: bool
     final_response: str
     current_agent: str
     retry_count: int
-    # v2 新增字段
     has_images: bool
     images: list[str]
     graph_context: dict[str, Any]
@@ -53,10 +68,7 @@ class AgentState(TypedDict):
 # ─── Preprocess 节点 ───
 
 async def preprocess_input(state: AgentState) -> AgentState:
-    """
-    预处理节点（入口）：检测多模态内容。
-    如果用户请求包含图片，设置 has_images 标志供后续路由决策使用。
-    """
+    """预处理节点（入口）：检测多模态内容"""
     images = state.get("images", [])
     return {
         **state,
@@ -64,32 +76,28 @@ async def preprocess_input(state: AgentState) -> AgentState:
     }
 
 
-# ─── Supervisor节点 ───
+# ─── Supervisor Prompt ───
 
 SUPERVISOR_SYSTEM_PROMPT = """你是一个智能客服系统的Supervisor（主管编排Agent）。
-你的职责是：
-1. 分析用户意图，决定分发给哪个子Agent处理
-2. 汇总子Agent的处理结果，生成最终回复
-3. 确保所有回复都经过合规审查
 
 可用的子Agent：
-- intent_router: 意图识别和分类
-- knowledge_rag: 知识库检索和回答
-- ticket_handler: 工单创建和查询
-- compliance_checker: 合规审查和敏感词检测
-- graph_rag: 知识图谱关系推理（用于产品关联、兼容搭配、替代推荐等多跳问题）
-- vision: 多模态图片分析（用于截图、票据、商品图片等视觉输入）
+- knowledge_rag: 知识库检索和回答（适用：产品参数、价格、政策查询、通用咨询）
+- graph_rag: 知识图谱关系推理（适用：配件兼容、替代推荐、多跳关联、生态搭配）
+- ticket_handler: 工单创建和查询（适用：退款、投诉、业务办理）
+- vision: 多模态图片分析（适用：截图、票据、商品图片）
+- compliance_checker: 合规审查和敏感词检测（所有回复必经此节点）
 
-路由决策规则：
-- 如果用户上传了图片/截图 → 优先路由到 vision
-- 如果问题涉及产品关联关系、兼容性、替代品推荐 → 路由到 graph_rag
-- 如果问题需要知识库搜索 → 路由到 knowledge_rag
-- 如果问题需要创建/查询工单 → 路由到 ticket_handler
-- 所有回复最终都要经过合规审查
+路由决策：
+- 图片/截图请求 → vision
+- 退款/投诉/工单 → ticket_handler
+- 其他全部 → knowledge_rag + graph_rag 并行（双路互补）
 
-根据用户消息，决定下一步路由到哪个Agent。
+根据用户消息，返回应路由到的Agent名称列表。
+只返回 JSON 数组，如 ["knowledge_rag", "graph_rag"] 或 ["ticket_handler"] 或 ["vision"]。
 """
 
+
+# ─── Supervisor节点 ───
 
 class SupervisorNode:
     """Supervisor决策节点"""
@@ -111,45 +119,55 @@ class SupervisorNode:
             SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
             SystemMessage(content=f"当前工作记忆上下文: {context}"),
             *messages,
+            HumanMessage(content="请返回应路由到的Agent名称列表（JSON数组）。"),
         ]
 
-        # 如果有图片，在 prompt 中提示优先考虑 vision
-        if has_images:
-            routing_prompt.append(HumanMessage(content=(
-                "注意：此请求包含图片/附件。请优先考虑是否需要 vision Agent 处理图片内容。"
-                "请根据用户消息内容和图片特征，返回最合适的Agent名称。"
-            )))
-        else:
-            routing_prompt.append(HumanMessage(content=(
-                "请分析用户的最新消息，返回应该路由到的Agent名称。"
-                "只返回以下之一: knowledge_rag, ticket_handler, compliance_checker, graph_rag, vision"
-            )))
-
         response = await self.llm.ainvoke(routing_prompt)
-        intent = response.content.strip().lower()
 
-        valid_intents = {"knowledge_rag", "ticket_handler", "compliance_checker", "graph_rag", "vision"}
-        if intent not in valid_intents:
-            # 如果用户上传了图片但 LLM 没选 vision，强制走 vision
-            if has_images:
-                intent = "vision"
-            else:
-                intent = "knowledge_rag"
+        # 解析路由决策
+        import json
+        try:
+            content = response.content.strip()
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1]
+                if content.endswith("```"):
+                    content = content[:-3]
+            agent_list = json.loads(content)
+            if not isinstance(agent_list, list):
+                agent_list = ["knowledge_rag", "graph_rag"]
+        except (json.JSONDecodeError, Exception):
+            # 默认：并行 knowledge_rag + graph_rag
+            agent_list = ["knowledge_rag", "graph_rag"]
 
-        self.working_memory.update(session_id, {"last_intent": intent})
+        # 确保有图片时包含 vision
+        if has_images and "vision" not in agent_list:
+            agent_list.insert(0, "vision")
+
+        # 过滤无效值
+        valid = {"knowledge_rag", "graph_rag", "ticket_handler", "vision", "compliance_check"}
+        agent_list = [a for a in agent_list if a in valid]
+
+        if not agent_list:
+            agent_list = ["knowledge_rag", "graph_rag"]
+
+        # 意图标记：取第一个作为主意图
+        primary_intent = agent_list[0] if agent_list else "knowledge_rag"
+        self.working_memory.update(session_id, {
+            "last_intent": primary_intent,
+            "routed_agents": agent_list,
+        })
 
         return {
             **state,
-            "intent": intent,
+            "intent": primary_intent,
             "current_agent": "supervisor",
         }
 
     @trace_agent_call("supervisor_synthesize")
     async def synthesize_response(self, state: AgentState) -> AgentState:
-        """汇总子Agent结果，生成最终回复"""
+        """汇总并行子Agent结果，生成最终回复"""
         sub_results = state.get("sub_results", {})
         compliance_passed = state.get("compliance_passed", True)
-        graph_context = state.get("graph_context", {})
 
         if not compliance_passed:
             final_response = (
@@ -159,21 +177,27 @@ class SupervisorNode:
         else:
             result_parts = []
 
-            # 优先展示 vision 结果（如果有图片）
+            # vision 结果优先展示
             vision_result = sub_results.get("vision")
             if vision_result and isinstance(vision_result, str) and vision_result.strip():
                 result_parts.append(f"📷 图片分析结果：\n{vision_result}")
 
-            # 然后展示 graph_rag 结果
-            graph_rag_result = sub_results.get("graph_rag")
-            if graph_rag_result and isinstance(graph_rag_result, str) and graph_rag_result.strip():
-                result_parts.append(graph_rag_result)
+            # knowledge_rag 和 graph_rag 结果融合
+            kg_result = sub_results.get("knowledge_rag")
+            graph_result = sub_results.get("graph_rag")
 
-            # 知识检索结果
-            knowledge_result = sub_results.get("knowledge_rag")
-            if knowledge_result and isinstance(knowledge_result, str) and knowledge_result.strip():
-                if "knowledge_rag" not in graph_context:
-                    result_parts.append(knowledge_result)
+            if kg_result and graph_result:
+                # 双路都有结果——用 LLM 做一次轻量融合去重
+                fused = await self._fuse_parallel_results(
+                    state.get("messages", [])[-1].content if state.get("messages") else "",
+                    kg_result,
+                    graph_result,
+                )
+                result_parts.append(fused)
+            elif kg_result:
+                result_parts.append(kg_result)
+            elif graph_result:
+                result_parts.append(graph_result)
 
             # 工单结果
             ticket_result = sub_results.get("ticket_handler")
@@ -190,25 +214,52 @@ class SupervisorNode:
             "messages": [AIMessage(content=final_response)],
         }
 
+    async def _fuse_parallel_results(
+        self, query: str, kg_answer: str, graph_answer: str,
+    ) -> str:
+        """融合两个并行Agent的回答：去重 + 互补拼接"""
+        # 如果两个回答高度重合（开头相同），只保留更长的
+        kg_start = kg_answer[:80].strip()
+        graph_start = graph_answer[:80].strip()
 
-# ─── 路由函数 ───
+        if kg_start == graph_start:
+            # 完全相同，保留更详细的
+            return kg_answer if len(kg_answer) >= len(graph_answer) else graph_answer
 
-def route_to_agent(state: AgentState) -> str:
-    """根据意图路由到对应Agent节点"""
-    intent = state.get("intent", "knowledge_rag")
-    route_map = {
-        "knowledge_rag": "knowledge_rag",
-        "ticket_handler": "ticket_handler",
-        "compliance_checker": "compliance_check",
-        "graph_rag": "graph_rag",
-        "vision": "vision",
-    }
-    return route_map.get(intent, "knowledge_rag")
+        # 互补：合并两个回答
+        return (
+            f"{kg_answer}\n\n"
+            f"---\n"
+            f"📎 补充信息（知识图谱）：\n{graph_answer}"
+        )
 
 
-def should_check_compliance(state: AgentState) -> str:
-    """所有回复都需经过合规审查"""
-    return "compliance_check"
+# ─── 路由函数（Send API 多路并行） ───
+
+def continue_to_agents(state: AgentState) -> list[Send]:
+    """
+    使用 LangGraph Send API 实现多路并行 fan-out。
+
+    根据 supervisor_route 的分析结果，向多个 Agent 同时发送状态。
+    LangGraph 会在所有分支完成后自动合并状态（通过 _merge_sub_results reducer）。
+    """
+    # 从 working memory 上下文读取路由决策
+    # 默认行为：电商查询同时走 knowledge_rag + graph_rag
+    intent = state.get("intent", "")
+    has_images = state.get("has_images", False)
+    sends: list[Send] = []
+
+    if has_images:
+        sends.append(Send("vision", state))
+
+    if intent == "ticket_handler":
+        sends.append(Send("ticket_handler", state))
+    else:
+        # 电商查询默认双路并行
+        sends.append(Send("knowledge_rag", state))
+        sends.append(Send("graph_rag", state))
+
+    return sends
 
 
 # ─── 构建Graph ───
@@ -217,25 +268,20 @@ def create_supervisor_graph(
     llm: ChatOpenAI | None = None,
     working_memory: WorkingMemory | None = None,
     short_term_memory: ShortTermMemory | None = None,
-    long_term_memory: LongTermMemory | None = None,
+    retriever: HybridRetriever | None = None,
     knowledge_graph: KnowledgeGraph | None = None,
     enable_checkpointing: bool = True,
 ) -> StateGraph:
     """
-    构建Supervisor编排的多Agent StateGraph。
-
-    这是整个系统的核心入口，将多个子Agent通过有向图连接起来，
-    由Supervisor节点负责路由决策和结果汇总。
-
-    v2: 新增 preprocess、graph_rag、vision 节点。
+    构建Supervisor编排的多Agent StateGraph（v3: 多路并行）。
 
     Args:
         llm: 语言模型实例
         working_memory: 工作记忆
         short_term_memory: 短期记忆
-        long_term_memory: 长期记忆
-        knowledge_graph: 知识图谱（新增）
-        enable_checkpointing: 是否启用检查点（支持断点恢复）
+        retriever: 混合检索引擎（替代 long_term_memory + sparse_index）
+        knowledge_graph: 知识图谱
+        enable_checkpointing: 是否启用检查点
     """
     if llm is None:
         llm = ChatOpenAI(model="gpt-4o", temperature=0)
@@ -246,10 +292,10 @@ def create_supervisor_graph(
 
     # 实例化所有子 Agent
     intent_router = IntentRouterAgent(llm)
-    knowledge_agent = KnowledgeRAGAgent(llm, long_term_memory)
+    knowledge_agent = KnowledgeRAGAgent(llm, retriever)
     ticket_agent = TicketHandlerAgent(llm)
     compliance_agent = ComplianceCheckerAgent(llm)
-    graph_rag_agent = GraphRAGAgent(llm, long_term_memory, knowledge_graph)
+    graph_rag_agent = GraphRAGAgent(llm, retriever, knowledge_graph)
     vision_agent = VisionAgent(llm)
 
     # 构建 StateGraph
@@ -267,18 +313,15 @@ def create_supervisor_graph(
 
     # 入口: preprocess → supervisor_route
     graph.set_entry_point("preprocess")
-
-    # preprocess 完成后进入路由
     graph.add_edge("preprocess", "supervisor_route")
 
-    # 条件路由: supervisor → 各子 Agent
+    # 条件路由: supervisor_route → 多路并行 fan-out
     graph.add_conditional_edges(
         "supervisor_route",
-        route_to_agent,
+        continue_to_agents,
         {
             "knowledge_rag": "knowledge_rag",
             "ticket_handler": "ticket_handler",
-            "compliance_check": "compliance_check",
             "graph_rag": "graph_rag",
             "vision": "vision",
         },

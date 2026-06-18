@@ -1,13 +1,14 @@
 """
-GraphRAG Agent — 混合检索（向量 + 图谱）
+GraphRAG Agent — 混合检索（向量 + BM25 + 图谱）
 
-结合向量语义搜索和知识图谱结构推理，回答多跳关系问题。
+结合混合检索引擎（FAISS+BM25）和知识图谱结构推理，回答多跳关系问题。
 典型场景：
 - "这款手机搭配哪种充电器最好？" → 商品 → 兼容配件 → 规格匹配
 - "订单取消后退款要走什么流程？" → 取消政策 → 退款流程 → 前置条件
 - "X产品下架了，有什么替代品？" → 商品 → alternative_to → 同类商品
 
-管线：实体提取 → 向量检索 → 图谱遍历 → 上下文合并 → 生成回答
+管线（优化后）：
+  实体提取 → HybridRetriever(entity_hints=实体名+entity_ids) → 图谱遍历 → 生成回答
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
-from memory.long_term import LongTermMemory
+from memory.retriever import HybridRetriever
 from memory.knowledge_graph import KnowledgeGraph
 from tracing.otel_config import trace_agent_call
 
@@ -47,7 +48,7 @@ GRAPH_RAG_SYSTEM_PROMPT = """你是一个电商智能客服专家，擅长结合
 回答规则：
 1. 基于提供的图结构信息和检索文档回答，不要编造
 2. 如果知识库中没有相关信息，明确告知用户
-3. 涉及产品推荐时，说明推荐理由（兼容性/性价比/用户评价依据）
+3. 涉及产品推荐时，说明推荐理由（兼容性/性价比依据）
 4. 涉及流程时，清晰列出步骤和前置条件
 5. 在回答末尾标注信息来源
 
@@ -62,21 +63,21 @@ GRAPH_RAG_SYSTEM_PROMPT = """你是一个电商智能客服专家，擅长结合
 
 class GraphRAGAgent:
     """
-    混合检索 Agent：向量搜索 + 图谱遍历。
+    混合检索 Agent：HybridRetriever（FAISS+BM25+元数据加权） + 图谱遍历。
 
     Usage:
-        agent = GraphRAGAgent(llm, long_term_memory, knowledge_graph)
+        agent = GraphRAGAgent(llm, retriever, knowledge_graph)
         result = await agent.process(state)
     """
 
     def __init__(
         self,
         llm: ChatOpenAI,
-        long_term_memory: LongTermMemory | None = None,
+        retriever: HybridRetriever | None = None,
         knowledge_graph: KnowledgeGraph | None = None,
     ):
         self.llm = llm
-        self.long_term_memory = long_term_memory or LongTermMemory()
+        self.retriever = retriever
         self.knowledge_graph = knowledge_graph or KnowledgeGraph()
 
     @trace_agent_call("graphrag_extract_entities")
@@ -89,7 +90,6 @@ class GraphRAGAgent:
         response = await self.llm.ainvoke(messages)
 
         try:
-            # 清理可能的 markdown 代码块包装
             content = response.content.strip()
             if content.startswith("```"):
                 content = content.split("\n", 1)[1]
@@ -99,29 +99,6 @@ class GraphRAGAgent:
             return entities if isinstance(entities, list) else []
         except (json.JSONDecodeError, Exception):
             return []
-
-    @trace_agent_call("graphrag_vector_search")
-    async def vector_search(
-        self, entities: list[dict[str, str]], top_k: int = 5
-    ) -> list[dict[str, Any]]:
-        """对每个实体做向量检索，合并去重"""
-        seen_ids: set[str] = set()
-        all_docs: list[dict[str, Any]] = []
-
-        # 用实体 name 拼接成查询语句
-        queries = [e.get("name", "") for e in entities if e.get("name")]
-        if not queries:
-            queries = [""]
-
-        for query in queries:
-            docs = self.long_term_memory.search(query, top_k=top_k)
-            for doc in docs:
-                doc_id = doc.get("id", doc.get("content", "")[:60])
-                if doc_id not in seen_ids:
-                    seen_ids.add(doc_id)
-                    all_docs.append(doc)
-
-        return all_docs
 
     @trace_agent_call("graphrag_graph_traverse")
     async def graph_traverse(
@@ -137,11 +114,10 @@ class GraphRAGAgent:
             ent_name = ent.get("name", "")
             ent_type = ent.get("type", "")
 
-            # 先按名称搜索图谱中的实体
             candidates = self.knowledge_graph.search_entities(ent_name)
 
             if not candidates:
-                # 放宽条件，只用名称片段搜索（取前两个字）
+                # 放宽条件：用名称片段搜索
                 if len(ent_name) >= 2:
                     candidates = self.knowledge_graph.search_entities(ent_name[:2])
 
@@ -164,7 +140,7 @@ class GraphRAGAgent:
 
         # 获取邻居详情
         neighbors: list[dict[str, Any]] = []
-        for eid in matched_entity_ids[:3]:  # 限制起点，避免爆炸
+        for eid in matched_entity_ids[:3]:
             nbrs = self.knowledge_graph.get_neighbors(eid, hops=max_hops)
             for n in nbrs:
                 if n["id"] not in [x["id"] for x in neighbors] + matched_entity_ids:
@@ -181,15 +157,19 @@ class GraphRAGAgent:
         self,
         query: str,
         graph_context: str,
-        vector_docs: list[dict[str, Any]],
+        retrieval_results: list,
     ) -> str:
-        """结合图谱上下文和向量检索文档生成最终回答"""
+        """结合图谱上下文和混合检索结果生成最终回答"""
         doc_text = ""
-        if vector_docs:
-            doc_text = "\n\n---\n\n".join(
-                f"来源: {doc.get('source', '未知')}\n内容: {doc.get('content', '')[:800]}"
-                for doc in vector_docs[:5]
-            )
+        if retrieval_results:
+            parts = []
+            for r in retrieval_results[:5]:
+                source = r.chunk.source or "未知"
+                part = f"来源: {source}\n内容: {r.chunk.content[:800]}"
+                if r.expanded_context:
+                    part += f"\n关联: {r.expanded_context[:200]}"
+                parts.append(part)
+            doc_text = "\n\n---\n\n".join(parts)
 
         context_parts = []
         if graph_context:
@@ -213,20 +193,42 @@ class GraphRAGAgent:
     @trace_agent_call("graphrag_hybrid_retrieve")
     async def hybrid_retrieve(self, query: str) -> dict[str, Any]:
         """
-        完整混合检索管线：
+        完整混合检索管线（优化后）：
         1. 从 query 提取实体
-        2. 向量检索获取语义相关文档
+        2. 通过 HybridRetriever 做 FAISS+BM25 混合检索（带实体加权）
         3. 图谱遍历获取结构化关系
         """
         entities = await self.extract_query_entities(query)
 
-        vector_docs = await self.vector_search(entities)
+        # 将实体名匹配为 KG entity_ids
+        entity_ids: list[str] = []
+        for ent in entities:
+            ent_name = ent.get("name", "")
+            if self.knowledge_graph:
+                matches = self.knowledge_graph.search_entities(ent_name)
+                for m in matches[:2]:
+                    eid = m.get("id", "")
+                    if eid and eid not in entity_ids:
+                        entity_ids.append(eid)
 
+        # 用 HybridRetriever 做混合检索（带实体加权）
+        if self.retriever is not None:
+            entity_names = [e.get("name", "") for e in entities if e.get("name")]
+            retrieval_results = self.retriever.retrieve_for_graph_rag(
+                query=query,
+                entities=entity_names,
+                entity_ids=entity_ids,
+                top_k=5,
+            )
+        else:
+            retrieval_results = []
+
+        # 图谱遍历
         graph_result = await self.graph_traverse(entities)
 
         return {
             "entities": entities,
-            "vector_docs": vector_docs,
+            "retrieval_results": retrieval_results,
             "graph_context": graph_result.get("graph_context", ""),
             "neighbors": graph_result.get("neighbors", []),
             "matched_entity_ids": graph_result.get("entity_ids", []),
@@ -236,13 +238,11 @@ class GraphRAGAgent:
     async def process(self, state: dict[str, Any]) -> dict[str, Any]:
         """
         作为 LangGraph 节点处理状态。
-        从 state 中读取用户最后一条消息，执行混合检索并生成回答。
         """
         messages = state.get("messages", [])
         if not messages:
             return state
 
-        # 取最后一条用户消息
         user_query = messages[-1].content if messages else ""
 
         # 运行混合检索
@@ -252,7 +252,7 @@ class GraphRAGAgent:
         answer = await self.generate_answer(
             query=user_query,
             graph_context=retrieval_result.get("graph_context", ""),
-            vector_docs=retrieval_result.get("vector_docs", []),
+            retrieval_results=retrieval_result.get("retrieval_results", []),
         )
 
         return {

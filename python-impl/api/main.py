@@ -24,6 +24,7 @@ from memory.long_term import LongTermMemory
 from memory.knowledge_graph import KnowledgeGraph
 from memory.sparse_index import SparseIndex
 from memory.structured_encoder import StructuredEncoder
+from memory.retriever import HybridRetriever
 from mcp.mcp_server import MCPToolServer, create_default_tools
 from tracing.otel_config import init_tracer, AgentMetrics
 
@@ -49,6 +50,7 @@ long_term_memory = LongTermMemory(
     embedding_mode=os.getenv("EMBEDDING_MODE", "hash"),  # "hash" 或 "openai"
 )
 sparse_index = None  # 在 lifespan 中初始化
+retriever = None     # 在 lifespan 中初始化
 knowledge_graph = KnowledgeGraph(
     persist_path=os.getenv("GRAPH_STORE_PATH", "./graph_store/graph.json"),
 )
@@ -233,12 +235,33 @@ async def lifespan(app: FastAPI):
         relationships=ECOMMERCE_GRAPH_DATA["relationships"],
     )
     knowledge_graph.save()
+    print(f"[init] 知识图谱: {knowledge_graph._graph.number_of_nodes()} nodes, "
+          f"{knowledge_graph._graph.number_of_edges()} edges")
 
-    # 构建 Supervisor Graph
+    # 初始化 LLM（供 HybridRetriever + Supervisor Graph 共用）
+    from langchain_openai import ChatOpenAI
+    llm = ChatOpenAI(
+        model=os.getenv("MODEL_NAME", "gpt-4o"),
+        temperature=0,
+    )
+
+    # 构建混合检索引擎（FAISS + BM25 + KG 元数据加权）
+    global retriever
+    retriever = HybridRetriever(
+        llm=llm,
+        long_term_memory=long_term_memory,
+        sparse_index=sparse_index,
+        knowledge_graph=knowledge_graph,
+    )
+    print(f"[init] 混合检索引擎: dense={retriever.get_statistics()['dense_available']}, "
+          f"sparse={retriever.get_statistics()['sparse_available']}")
+
+    # 构建 Supervisor Graph（v3: 多路并行）
     graph = create_supervisor_graph(
+        llm=llm,
         working_memory=working_memory,
         short_term_memory=short_term_memory,
-        long_term_memory=long_term_memory,
+        retriever=retriever,
         knowledge_graph=knowledge_graph,
     )
 
