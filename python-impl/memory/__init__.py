@@ -7,6 +7,7 @@ from memory.ocr import OCRBackend, OpenAIVisionBackend, PaddleOCRBackend
 from memory.sparse_index import SparseIndex
 from memory.structured_encoder import StructuredEncoder
 from memory.retriever import HybridRetriever, QueryAnalysis, RetrievalResult
+from memory.index_manifest import IndexManifest
 
 __all__ = [
     "WorkingMemory",
@@ -26,4 +27,5 @@ __all__ = [
     "HybridRetriever",
     "QueryAnalysis",
     "RetrievalResult",
+    "IndexManifest",
 ]

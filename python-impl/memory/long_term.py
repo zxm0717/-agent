@@ -465,13 +465,111 @@ class LongTermMemory:
             vec = self._embed(chunk.content)
             self._index.add(vec.reshape(1, -1))
 
+    def remove_chunks_by_source(self, source: str) -> int:
+        """
+        按 source（文件名或结构化虚拟路径）删除所有关联 chunk。
+        因为 FAISS IndexFlatIP 不支持单条删除，所以删除后需要调用
+        rebuild_faiss_index() 重建向量索引。
+
+        Returns:
+            删除的 chunk 数量
+        """
+        removed_count = 0
+        removed_ids: set[str] = set()
+
+        # 先标记要删的 chunk_id（含被删 chunk 作为 parent 的子 chunk）
+        for chunk in self.chunks:
+            if chunk.source == source:
+                removed_ids.add(chunk.chunk_id)
+                removed_count += 1
+
+        # 清理 parent_id 引用（指向被删 chunk 的子 chunk 解绑）
+        for chunk in self.chunks:
+            if chunk.parent_id in removed_ids:
+                chunk.parent_id = None
+
+        # 从列表移除
+        self.chunks = [c for c in self.chunks if c.source != source]
+
+        # 删除后重建 FAISS 索引（IndexFlatIP 无 remove 接口）
+        if removed_count > 0 and self._index is not None:
+            self.rebuild_faiss_index()
+
+        return removed_count
+
+    def rebuild_faiss_index(self):
+        """从当前 chunks 列表全量重建 FAISS 索引（用于增量删除后的恢复）"""
+        if faiss is None:
+            return
+
+        self._index = faiss.IndexFlatIP(self.embedding_dim)
+
+        for chunk in self.chunks:
+            vec = self._embed(chunk.content)
+            self._index.add(vec.reshape(1, -1))
+
+    def load_single_file(
+        self,
+        file_path: str | Path,
+        kb_dir: str | Path,
+        ocr_backend=None,
+    ) -> int:
+        """
+        解析并索引单个文件（用于增量新增/修改）。
+        先删除该 source 的旧 chunk，再解析 + 添加。
+
+        Args:
+            file_path: 绝对或相对文件路径
+            kb_dir: 知识库根目录（用于计算相对路径）
+            ocr_backend: OCRBackend 或 None
+
+        Returns:
+            新增的 chunk 数量
+        """
+        import os as _os
+
+        file_path = Path(file_path)
+        kb_dir = Path(kb_dir)
+
+        # 计算相对路径作为 source 标识
+        try:
+            source = str(file_path.relative_to(kb_dir)).replace("\\", "/")
+        except ValueError:
+            source = file_path.name
+
+        ext = file_path.suffix.lower()
+        parser = DocParser(ocr_backend=ocr_backend)
+
+        if ext not in parser.supported_extensions:
+            return 0
+
+        doc = parser.parse(str(file_path))
+
+        if doc.parse_warnings:
+            for w in doc.parse_warnings:
+                print(f"  [DocParser] {w}")
+
+        if not doc.cleaned_text and not doc.raw_text:
+            return 0
+
+        # 删旧
+        self.remove_chunks_by_source(source)
+
+        # 解析 + 分块 + 添加
+        chunks = self.chunker.chunk(doc, source=source)
+
+        for chunk in chunks:
+            self.add_chunk(chunk)
+
+        return len(chunks)
+
     def load_knowledge_base(
         self,
         kb_dir: str,
         ocr_backend=None,
     ) -> int:
         """
-        从目录加载知识库，自动分块 + 索引。
+        从目录加载知识库，自动分块 + 索引（全量重建）。
 
         Args:
             kb_dir: 知识库目录路径
@@ -504,7 +602,13 @@ class LongTermMemory:
             if not doc.cleaned_text and not doc.raw_text:
                 continue
 
-            chunks = self.chunker.chunk(doc, source=file_path.name)
+            # source 用相对路径（相对于 kb_dir.parent），与 IndexManifest.scan_dir 一致
+            try:
+                source = str(file_path.relative_to(kb_path.parent)).replace("\\", "/")
+            except ValueError:
+                source = file_path.name
+
+            chunks = self.chunker.chunk(doc, source=source)
 
             for chunk in chunks:
                 self.add_chunk(chunk)
@@ -513,6 +617,115 @@ class LongTermMemory:
 
         self.save()
         return total_chunks
+
+    def load_knowledge_base_incremental(
+        self,
+        kb_dir: str,
+        manifest=None,
+        ocr_backend=None,
+    ) -> dict:
+        """
+        增量加载知识库：对比文件 Hash，仅处理变更文件。
+        首次运行（无 manifest 或为空）自动退化为全量加载。
+
+        Args:
+            kb_dir: 知识库目录路径
+            manifest: IndexManifest 实例或 None
+            ocr_backend: OCRBackend 或 None
+
+        Returns:
+            {
+                "mode": "full" | "incremental",
+                "total_chunks": int,
+                "added": int, "modified": int, "deleted": int,
+                "files_added": [...], "files_modified": [...], "files_deleted": [...],
+            }
+        """
+        from memory.index_manifest import IndexManifest
+
+        kb_path = Path(kb_dir)
+        if not kb_path.exists():
+            return {"mode": "none", "total_chunks": 0, "added": 0, "modified": 0, "deleted": 0}
+
+        # 无 manifest 或首次运行 → 全量
+        if manifest is None or manifest.is_empty:
+            total = self.load_knowledge_base(kb_dir, ocr_backend=ocr_backend)
+            return {
+                "mode": "full",
+                "total_chunks": total,
+                "added": total, "modified": 0, "deleted": 0,
+                "files_added": [], "files_modified": [], "files_deleted": [],
+            }
+
+        # 扫描当前文件 Hash
+        current_hashes = IndexManifest.scan_dir(kb_dir)
+
+        # Diff
+        diff = manifest.diff(current_hashes)
+
+        # 无变更 → 直接返回（但 chunks 仍然需要从磁盘加载）
+        if not diff.added and not diff.modified and not diff.deleted:
+            return {
+                "mode": "incremental",
+                "total_chunks": len(self.chunks),
+                "added": 0, "modified": 0, "deleted": 0,
+                "files_added": [], "files_modified": [], "files_deleted": [],
+            }
+
+        print(f"[index] 增量索引: +{len(diff.added)} 新增 / "
+              f"~{len(diff.modified)} 修改 / -{len(diff.deleted)} 删除")
+
+        added_count = 0
+        modified_count = 0
+        deleted_count = 0
+
+        # 处理删除
+        for rel_path in diff.deleted:
+            removed = self.remove_chunks_by_source(rel_path)
+            deleted_count += removed
+            manifest.files.pop(rel_path, None)
+            print(f"  [del] {rel_path} → -{removed} chunks")
+
+        # 处理修改（先删后加）
+        for rel_path in diff.modified:
+            abs_path = kb_path.parent / rel_path
+            if not abs_path.exists():
+                continue
+
+            removed = self.remove_chunks_by_source(rel_path)
+            new_count = self.load_single_file(abs_path, kb_path.parent, ocr_backend=ocr_backend)
+            modified_count += new_count
+            manifest.files[rel_path] = current_hashes[rel_path]
+            print(f"  [mod] {rel_path} → -{removed} +{new_count} chunks")
+
+        # 处理新增
+        for rel_path in diff.added:
+            abs_path = kb_path.parent / rel_path
+            if not abs_path.exists():
+                continue
+
+            new_count = self.load_single_file(abs_path, kb_path.parent, ocr_backend=ocr_backend)
+            added_count += new_count
+            manifest.files[rel_path] = current_hashes[rel_path]
+            print(f"  [add] {rel_path} → +{new_count} chunks")
+
+        # 更新 manifest 中的结构化条目不受文件扫描影响，手动保留
+        # （结构化 key 以 __structured__/ 开头，不在 scan_dir 范围内）
+
+        # 保存
+        self.save()
+        manifest.save()
+
+        return {
+            "mode": "incremental",
+            "total_chunks": len(self.chunks),
+            "added": added_count,
+            "modified": modified_count,
+            "deleted": deleted_count,
+            "files_added": diff.added,
+            "files_modified": diff.modified,
+            "files_deleted": diff.deleted,
+        }
 
     # ─── 检索 ───
 

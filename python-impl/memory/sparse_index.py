@@ -137,6 +137,42 @@ class SparseIndex:
         for chunk in chunks:
             self.index_chunk(chunk)
 
+    def rebuild_from_chunks(self, chunks: list[Any]) -> int:
+        """
+        从 LongTermMemory.chunks 全量重建倒排索引。
+        用于增量更新后的同步 —— 先清空，再逐条重建。
+        对于百级 chunk 规模，重建耗时 <50ms。
+
+        Returns:
+            索引的 chunk 总数
+        """
+        self.clear()
+        self.index_chunks(chunks)
+        return self._doc_count
+
+    def clear(self):
+        """清空全部索引数据"""
+        self._inverted.clear()
+        self._doc_freq.clear()
+        self._doc_lengths.clear()
+        self._chunks.clear()
+        self._doc_count = 0
+        self._avg_doc_len = 0.0
+
+    def remove_chunks_by_ids(self, chunk_ids: set[str]) -> int:
+        """
+        按 chunk_id 集合批量移除，用于增量删除文件后同步倒排。
+
+        Returns:
+            实际删除的 chunk 数量
+        """
+        removed = 0
+        for cid in list(chunk_ids):
+            if cid in self._chunks:
+                self.remove_chunk(cid)
+                removed += 1
+        return removed
+
     def remove_chunk(self, chunk_id: str):
         """从索引中移除一个 chunk"""
         if chunk_id not in self._chunks:

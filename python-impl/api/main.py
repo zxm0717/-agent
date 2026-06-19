@@ -25,6 +25,7 @@ from memory.knowledge_graph import KnowledgeGraph
 from memory.sparse_index import SparseIndex
 from memory.structured_encoder import StructuredEncoder
 from memory.retriever import HybridRetriever
+from memory.index_manifest import IndexManifest
 from mcp.mcp_server import MCPToolServer, create_default_tools
 from tracing.otel_config import init_tracer, AgentMetrics
 
@@ -198,38 +199,121 @@ async def lifespan(app: FastAPI):
         otlp_endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
     )
 
-    # 从 data/knowledge_base/ 加载文档，自动解析 + 语义分块 + 向量索引
-    chunk_count = long_term_memory.load_knowledge_base(KNOWLEDGE_BASE_DIR)
-    print(f"[init] 向量索引: {chunk_count} chunks (embedding={long_term_memory.embedding_mode})")
+    global sparse_index, retriever, graph
 
-    # 构建 BM25 稀疏关键词索引
-    global sparse_index
-    sparse_index = SparseIndex()
-    sparse_index.index_chunks(long_term_memory.chunks)
-    print(f"[init] BM25 索引: {sparse_index._doc_count} docs, {len(sparse_index._inverted)} terms")
-
-    # 结构化数据编码后追加入索引
-    enc = StructuredEncoder()
-    sku_chunk = enc.encode_sku(
-        "星耀X1", {"storage": "256GB", "price": 4299, "color": "曜石黑"}, "标准版"
+    # ─── 增量索引配置 ───
+    manifest_path = os.path.join(
+        os.path.dirname(__file__), "..",
+        os.getenv("INDEX_MANIFEST_PATH", "./vector_store/index_manifest.json"),
     )
-    long_term_memory.add_chunk(sku_chunk)
-    sparse_index.index_chunk(sku_chunk)
-    encoded_count = 1
+    manifest = IndexManifest.load(manifest_path)
+    incremental_enabled = os.getenv("INCREMENTAL_INDEX_ENABLED", "1") == "1"
 
-    # 编码价格梯度
-    price_chunk = enc.encode_price_tier("星耀X1", [
-        {"label": "256GB", "price": 4299, "entity_id": "x1_phone"},
-        {"label": "512GB", "price": 5299, "entity_id": "x1_phone"},
-        {"label": "1TB", "price": 6299, "entity_id": "x1_phone"},
-    ])
-    long_term_memory.add_chunk(price_chunk)
-    sparse_index.index_chunk(price_chunk)
-    encoded_count += 1
+    # ─── 索引构建：增量 vs 全量 ───
+    if incremental_enabled and not manifest.is_empty:
+        # 增量模式：仅处理变更文件
+        result = long_term_memory.load_knowledge_base_incremental(
+            KNOWLEDGE_BASE_DIR, manifest=manifest,
+        )
+        print(
+            f"[init] 向量索引 (增量): {result['total_chunks']} chunks "
+            f"(+{result['added']}/~{result['modified']}/-{result['deleted']})"
+            f" | embedding={long_term_memory.embedding_mode}"
+        )
 
-    print(f"[init] 结构化编码: {encoded_count} chunks")
+        # SparseIndex: 从 long_term_memory.chunks 全量重建（百级 chunk 耗时 <50ms）
+        sparse_index = SparseIndex()
+        sparse_index.rebuild_from_chunks(long_term_memory.chunks)
+        print(
+            f"[init] BM25 索引: {sparse_index._doc_count} docs, "
+            f"{len(sparse_index._inverted)} terms"
+        )
+    else:
+        # 全量模式：首次启动 或 增量关闭
+        if not manifest.is_empty:
+            print("[init] 增量索引已关闭，执行全量重建...")
 
-    # 构建知识图谱（结构化数据）
+        chunk_count = long_term_memory.load_knowledge_base(KNOWLEDGE_BASE_DIR)
+        print(
+            f"[init] 向量索引 (全量): {chunk_count} chunks"
+            f" | embedding={long_term_memory.embedding_mode}"
+        )
+
+        sparse_index = SparseIndex()
+        sparse_index.index_chunks(long_term_memory.chunks)
+        print(
+            f"[init] BM25 索引: {sparse_index._doc_count} docs, "
+            f"{len(sparse_index._inverted)} terms"
+        )
+
+        # 更新 manifest 基础文件 Hash
+        file_hashes = IndexManifest.scan_dir(KNOWLEDGE_BASE_DIR)
+        manifest.files.update(file_hashes)
+
+    # ─── 结构化数据编码（增量感知）───
+    enc = StructuredEncoder()
+    structured_specs: list[dict] = [
+        {
+            "key": "__structured__/sku_x1_standard",
+            "content": "星耀X1手机，标准版：256GB存储，售价4299元。",
+            "build": lambda: enc.encode_sku(
+                "星耀X1", {"storage": "256GB", "price": 4299, "color": "曜石黑"}, "标准版"
+            ),
+        },
+        {
+            "key": "__structured__/price_tier_x1",
+            "content": "星耀X1共有三个版本：256GB版4299元、512GB版5299元、1TB版6299元。",
+            "build": lambda: enc.encode_price_tier("星耀X1", [
+                {"label": "256GB", "price": 4299, "entity_id": "x1_phone"},
+                {"label": "512GB", "price": 5299, "entity_id": "x1_phone"},
+                {"label": "1TB", "price": 6299, "entity_id": "x1_phone"},
+            ]),
+        },
+    ]
+
+    changed_keys = []
+    for spec in structured_specs:
+        key = spec["key"]
+        current_hash = IndexManifest.content_hash(spec["content"])
+        if manifest.files.get(key) != current_hash:
+            changed_keys.append(key)
+
+    if changed_keys:
+        # 批量删旧
+        removed_ids: set[str] = set()
+        for key in changed_keys:
+            removed_ids.update(
+                c.chunk_id for c in long_term_memory.chunks if c.source == key
+            )
+        long_term_memory.chunks = [
+            c for c in long_term_memory.chunks if c.chunk_id not in removed_ids
+        ]
+        sparse_index.remove_chunks_by_ids(removed_ids)
+
+        # 批量加新
+        for spec in structured_specs:
+            key = spec["key"]
+            if key in changed_keys:
+                new_chunk = spec["build"]()
+                long_term_memory.chunks.append(new_chunk)
+                sparse_index.index_chunk(new_chunk)
+                manifest.files[key] = IndexManifest.content_hash(spec["content"])
+
+        # 一次性重建 FAISS + 持久化
+        long_term_memory.rebuild_faiss_index()
+        long_term_memory.save()
+        print(f"[init] 结构化编码: {len(changed_keys)} chunks 更新")
+    else:
+        print(f"[init] 结构化编码: 无变更（跳过）")
+
+    # ─── 持久化 manifest ───
+    from datetime import datetime
+    manifest.meta["last_indexed_at"] = datetime.now().isoformat()
+    manifest.meta["total_chunks"] = len(long_term_memory.chunks)
+    manifest.meta["embedding_mode"] = long_term_memory.embedding_mode
+    manifest.save()
+
+    # ─── 构建知识图谱（结构化数据，始终全量快速重建）───
     knowledge_graph.build_from_structured(
         entities=ECOMMERCE_GRAPH_DATA["entities"],
         relationships=ECOMMERCE_GRAPH_DATA["relationships"],
