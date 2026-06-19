@@ -28,5 +28,8 @@ PyPDF2>=3.0
 # BM25 sparse index (Chinese word segmentation)
 jieba>=0.42
 
+# BGE local embedding (optional — free & offline Chinese-optimized)
+sentence-transformers>=3.0
+
 # OCR (optional — only needed for PaddleOCRBackend)
 # paddleocr>=2.9

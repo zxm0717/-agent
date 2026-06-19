@@ -371,6 +371,7 @@ class LongTermMemory:
     embedding_mode:
         "hash"   — 确定性随机向量（demo / 无 API key 时默认）
         "openai" — OpenAI text-embedding-3-small 语义向量
+        "bge"    — BAAI/bge-small-zh-v1.5 本地模型（免费、离线、中文最优）
 
     Usage:
         ltm = LongTermMemory(embedding_mode="openai")
@@ -398,6 +399,7 @@ class LongTermMemory:
         self.chunks: list[Chunk] = []
         self._index = None
         self._embedding_cache: dict[str, np.ndarray] = {}
+        self._bge_model = None
         self._init_index()
 
     def _init_index(self):
@@ -423,6 +425,8 @@ class LongTermMemory:
     def _embed(self, text: str) -> np.ndarray:
         if self.embedding_mode == "openai":
             return self._openai_embed(text)
+        elif self.embedding_mode == "bge":
+            return self._bge_embed(text)
         else:
             return self._hash_embed(text)
 
@@ -433,6 +437,37 @@ class LongTermMemory:
         vec = np.random.randn(self.embedding_dim).astype(np.float32)
         vec /= np.linalg.norm(vec)
         return vec
+
+    def _bge_embed(self, text: str) -> np.ndarray:
+        """BGE 本地模型（BAAI/bge-small-zh-v1.5，免费离线，中文最优）"""
+        if text in self._embedding_cache:
+            return self._embedding_cache[text]
+
+        try:
+            # 延迟加载，仅首次调用时下载模型（~100MB）
+            if self._bge_model is None:
+                from sentence_transformers import SentenceTransformer
+                # bge-small-zh-v1.5: 512维，CPU可用，中文语义优秀
+                self._bge_model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
+
+            vec = self._bge_model.encode(
+                text,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            vec = vec.astype(np.float32)
+
+            # 维度适配：bge-small 原生 512 维，需 pad 到配置的 embedding_dim
+            if vec.shape[0] < self.embedding_dim:
+                padded = np.zeros(self.embedding_dim, dtype=np.float32)
+                padded[:vec.shape[0]] = vec
+                vec = padded
+
+            self._embedding_cache[text] = vec
+            return vec
+        except Exception:
+            # 模型未安装或下载失败，回退到 hash
+            return self._hash_embed(text)
 
     def _openai_embed(self, text: str) -> np.ndarray:
         """OpenAI Embedding API（语义向量，带缓存）"""
