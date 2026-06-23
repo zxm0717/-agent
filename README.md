@@ -156,12 +156,11 @@ curl -X POST http://localhost:8000/api/tools/call \
 
 ```
 python-impl/
-├── agents/                           # 7 个 Agent，LangGraph 节点
+├── agents/                           # 5 个 Agent，LangGraph 节点
 │   ├── supervisor.py                 # 中央编排: 并行路由(Send API) + 结果融合
 │   ├── knowledge_rag.py              # 知识检索: HybridRetriever → LLM 生成
 │   ├── graph_rag.py                  # 图谱检索: 实体提取 → KG 遍历 → 生成
 │   ├── vision.py                     # 视觉分析: GPT-4o 多模态识别
-│   ├── intent_router.py              # 意图路由: 7 类意图分类 + 实体提取
 │   ├── ticket_handler.py             # 工单处理: 创建/查询/流转
 │   └── compliance_checker.py         # 合规审查: 规则引擎 + LLM 双阶段
 │

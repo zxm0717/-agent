@@ -22,7 +22,6 @@ from langgraph.graph.message import add_messages
 from langgraph.types import Send
 from langgraph.checkpoint.memory import MemorySaver
 
-from agents.intent_router import IntentRouterAgent
 from agents.knowledge_rag import KnowledgeRAGAgent
 from agents.ticket_handler import TicketHandlerAgent
 from agents.compliance_checker import ComplianceCheckerAgent
@@ -290,7 +289,6 @@ def create_supervisor_graph(
     supervisor = SupervisorNode(llm)
 
     # 实例化所有子 Agent
-    intent_router = IntentRouterAgent(llm)
     knowledge_agent = KnowledgeRAGAgent(llm, retriever)
     ticket_agent = TicketHandlerAgent(llm)
     compliance_agent = ComplianceCheckerAgent(llm)
