@@ -46,12 +46,14 @@ class KnowledgeRAGAgent:
         self.retriever = retriever
 
     @trace_agent_call("rag_generate")
-    async def generate_answer(self, query: str, results: list) -> str:
-        """基于检索结果生成回答"""
+    async def generate_answer(
+        self, query: str, results: list, history_messages: list | None = None,
+    ) -> str:
+        """基于检索结果 + 对话历史生成回答"""
         if not results:
             return "抱歉，知识库中暂未找到与您问题相关的信息。建议您联系人工客服获取帮助。"
 
-        # 构建上下文：主内容 + expanded_context
+        # 构建检索上下文
         context_parts = []
         for i, r in enumerate(results):
             chunk_text = r.chunk.content[:800]
@@ -66,9 +68,21 @@ class KnowledgeRAGAgent:
 
         context = "\n\n---\n\n".join(context_parts)
 
+        # 构建对话历史（最近 3 轮，用于多轮理解）
+        history_text = ""
+        if history_messages:
+            recent = history_messages[-6:]  # 最近 3 轮（user+assistant × 3）
+            if len(recent) > 1:
+                lines = []
+                for m in recent:
+                    role = "用户" if isinstance(m, HumanMessage) else "客服"
+                    lines.append(f"{role}: {m.content[:200]}")
+                history_text = "## 对话历史\n" + "\n".join(lines) + "\n\n"
+
         messages = [
             SystemMessage(content=RAG_SYSTEM_PROMPT),
             HumanMessage(content=(
+                f"{history_text}"
                 f"用户问题: {query}\n\n"
                 f"检索到的参考文档:\n{context}"
             )),
@@ -82,13 +96,16 @@ class KnowledgeRAGAgent:
         """
         完整 RAG 流程（作为 LangGraph 节点）：
         1. 混合检索（FAISS + BM25 + RRF + 元数据加权 + 上下文扩展）
-        2. 生成回答
+        2. 生成回答（带对话历史上下文）
         """
         messages = state.get("messages", [])
         if not messages:
             return state
 
         query = messages[-1].content
+
+        # 对话历史（不含当前消息，供生成阶段理解多轮上下文）
+        history = messages[:-1] if len(messages) > 1 else []
 
         # 混合检索
         if self.retriever is not None:
@@ -97,7 +114,7 @@ class KnowledgeRAGAgent:
             results = []
 
         # 生成回答
-        answer = await self.generate_answer(query, results)
+        answer = await self.generate_answer(query, results, history_messages=history)
 
         return {
             **state,

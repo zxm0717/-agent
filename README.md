@@ -59,11 +59,13 @@ data/knowledge_base/ (txt / md / pdf / 图片)
 
 ```
 Query
-  → Supervisor 并行路由
-      ├─→ knowledge_rag → LLM分析 → FAISS → BM25 → RRF融合 → 加权 → 生成
-      └─→ graph_rag → 实体提取 → KG遍历 → 生成
+  → 短期记忆加载 (Redis 对话历史注入 state)
+  → Supervisor 并行路由（基于历史上下文做意图判断）
+      ├─→ knowledge_rag → LLM分析 → FAISS → BM25 → RRF融合 → 加权 → 生成（带历史）
+      └─→ graph_rag → 实体提取 → KG遍历 → 生成（带历史）
   → Compliance Check (规则 + LLM 双阶段)
   → Synthesize (去重融合)
+  → 短期记忆写入 (本轮 user + assistant 追加)
 ```
 
 ---
@@ -164,8 +166,7 @@ python-impl/
 │   └── compliance_checker.py         # 合规审查: 规则引擎 + LLM 双阶段
 │
 ├── memory/                           # 记忆系统 + 索引引擎 + 检索器
-│   ├── working_memory.py             # 工作记忆: 会话级临时上下文
-│   ├── short_term.py                 # 短期记忆: 对话历史 (Redis)
+│   ├── short_term.py                 # 短期记忆: 对话历史 (Redis)，每次请求注入 Agent 管线
 │   ├── long_term.py                  # 长期记忆: FAISS + SemanticChunker + 三模式 Embedding
 │   ├── knowledge_graph.py            # 知识图谱: NetworkX 有向图 + BFS + JSON 持久化
 │   ├── doc_parser.py                 # 文档解析: txt/md/pdf/图片 → 统一文本
@@ -258,13 +259,12 @@ Query → ① LLM 分析 (实体提取 + chunk_type 推断 + rewrite)
 - 结构化编码（SKU/价格）同样纳入增量感知
 - `INCREMENTAL_INDEX_ENABLED=0` 可强制全量重建
 
-### 7. 三层记忆
+### 7. 双层记忆
 
-| 层 | 存活周期 | 存储 | 容量 |
+| 层 | 存活周期 | 存储 | 用途 |
 |----|---------|------|------|
-| 工作记忆 | 单会话 | dict | 意图/路由/实体 |
-| 短期记忆 | 多轮对话 | Redis | 可配置 LRU 窗口 |
-| 长期记忆 | 持久 | FAISS + BM25 + NetworkX | 知识库全量 |
+| 短期记忆 | 多轮对话 (TTL 30min) | Redis (内存 fallback) | 每次请求加载历史注入 Agent 管线，Supervisor + 所有子 Agent 均感知多轮上下文 |
+| 长期记忆 | 持久 | FAISS + BM25 + NetworkX | 知识库全量：文档检索、图谱推理、结构化编码 |
 
 ### 8. MCP 工具协议
 

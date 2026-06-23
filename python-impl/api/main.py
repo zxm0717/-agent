@@ -18,7 +18,6 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from agents.supervisor import create_supervisor_graph
-from memory.working_memory import WorkingMemory
 from memory.short_term import ShortTermMemory
 from memory.long_term import LongTermMemory
 from memory.knowledge_graph import KnowledgeGraph
@@ -44,7 +43,6 @@ load_dotenv()
 
 # ─── 全局服务实例 ───
 
-working_memory = WorkingMemory()
 short_term_memory = ShortTermMemory(redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 long_term_memory = LongTermMemory(
     index_path=os.getenv("FAISS_INDEX_PATH", "./vector_store/faiss_index"),
@@ -343,8 +341,6 @@ async def lifespan(app: FastAPI):
     # 构建 Supervisor Graph（v3: 多路并行）
     graph = create_supervisor_graph(
         llm=llm,
-        working_memory=working_memory,
-        short_term_memory=short_term_memory,
         retriever=retriever,
         knowledge_graph=knowledge_graph,
     )
@@ -381,12 +377,22 @@ async def chat(request: ChatRequest):
 
     session_id = request.session_id or str(uuid.uuid4())
 
+    # ─── 从短期记忆加载对话历史 ───
+    from langchain_core.messages import HumanMessage, AIMessage
+
+    history = await short_term_memory.get_history(session_id, last_n=20)
+    history_messages = []
+    for msg in history:
+        if msg["role"] == "user":
+            history_messages.append(HumanMessage(content=msg["content"]))
+        elif msg["role"] == "assistant":
+            history_messages.append(AIMessage(content=msg["content"]))
+
+    # 当前消息写入短期记忆
     await short_term_memory.add_message(session_id, "user", request.message)
 
-    from langchain_core.messages import HumanMessage
-
     initial_state = {
-        "messages": [HumanMessage(content=request.message)],
+        "messages": [*history_messages, HumanMessage(content=request.message)],
         "user_id": request.user_id,
         "session_id": session_id,
         "intent": "",
@@ -443,12 +449,22 @@ async def chat_multimodal(request: ChatMultiModalRequest):
         if validation["valid"]:
             valid_images.append(img)
 
+    # ─── 从短期记忆加载对话历史 ───
+    from langchain_core.messages import HumanMessage, AIMessage
+
+    history = await short_term_memory.get_history(session_id, last_n=20)
+    history_messages = []
+    for msg in history:
+        if msg["role"] == "user":
+            history_messages.append(HumanMessage(content=msg["content"]))
+        elif msg["role"] == "assistant":
+            history_messages.append(AIMessage(content=msg["content"]))
+
+    # 当前消息写入短期记忆
     await short_term_memory.add_message(session_id, "user", request.message)
 
-    from langchain_core.messages import HumanMessage
-
     initial_state = {
-        "messages": [HumanMessage(content=request.message)],
+        "messages": [*history_messages, HumanMessage(content=request.message)],
         "user_id": request.user_id,
         "session_id": session_id,
         "intent": "",

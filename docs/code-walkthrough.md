@@ -26,7 +26,6 @@ async def lifespan(app: FastAPI):
 
     # 4. 构建 LangGraph 编排图
     graph = create_supervisor_graph(
-        working_memory=working_memory,
         short_term_memory=short_term_memory,
         long_term_memory=long_term_memory,
         knowledge_graph=knowledge_graph,
@@ -171,12 +170,11 @@ Edge: {source → target, type(compatible_with|applies_to|...), properties}
 
 ## 7. 记忆系统
 
-| 记忆层 | 文件 | 存储 | 生命周期 |
-|--------|------|------|----------|
-| 工作记忆 | `working_memory.py` | 内存 dict | 单 Session |
-| 短期记忆 | `short_term.py` | Redis | TTL 30min |
-| 长期记忆 | `long_term.py` | FAISS 磁盘 | 永久 |
-| 知识图谱 | `knowledge_graph.py` | NetworkX/JSON | 永久 |
+| 记忆层 | 文件 | 存储 | 生命周期 | 用途 |
+|--------|------|------|----------|------|
+| 短期记忆 | `short_term.py` | Redis (内存 fallback) | TTL 30min | 每次请求加载历史注入 Agent 管线 |
+| 长期记忆 | `long_term.py` | FAISS 磁盘 | 永久 | 文档向量检索 + BM25 关键词索引 |
+| 知识图谱 | `knowledge_graph.py` | NetworkX/JSON | 永久 | 实体关系推理 + 多跳路径 |
 
 ---
 

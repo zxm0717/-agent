@@ -28,7 +28,6 @@ from agents.ticket_handler import TicketHandlerAgent
 from agents.compliance_checker import ComplianceCheckerAgent
 from agents.graph_rag import GraphRAGAgent
 from agents.vision import VisionAgent
-from memory.working_memory import WorkingMemory
 from memory.short_term import ShortTermMemory
 from memory.knowledge_graph import KnowledgeGraph
 from memory.retriever import HybridRetriever
@@ -102,25 +101,33 @@ SUPERVISOR_SYSTEM_PROMPT = """你是一个智能客服系统的Supervisor（主�
 class SupervisorNode:
     """Supervisor决策节点"""
 
-    def __init__(self, llm: ChatOpenAI, working_memory: WorkingMemory):
+    def __init__(self, llm: ChatOpenAI):
         self.llm = llm
-        self.working_memory = working_memory
 
     @trace_agent_call("supervisor")
     async def route_decision(self, state: AgentState) -> AgentState:
-        """分析用户意图，决定路由"""
+        """分析用户意图，决定路由（基于对话历史上下文）"""
         messages = state["messages"]
-        session_id = state.get("session_id", "default")
         has_images = state.get("has_images", False)
 
-        context = self.working_memory.get_context(session_id)
+        # 从对话历史中提取最近几轮作为路由上下文
+        recent_history = messages[-10:] if len(messages) > 10 else messages
+        history_context = "\n".join(
+            f"{'用户' if isinstance(m, HumanMessage) else '客服'}: {m.content[:200]}"
+            for m in recent_history[:-1]  # 排除最后一条（当前请求）
+        )
 
         routing_prompt = [
             SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
-            SystemMessage(content=f"当前工作记忆上下文: {context}"),
             *messages,
             HumanMessage(content="请返回应路由到的Agent名称列表（JSON数组）。"),
         ]
+
+        if history_context:
+            routing_prompt.insert(
+                1,
+                SystemMessage(content=f"最近的对话历史: {history_context}"),
+            )
 
         response = await self.llm.ainvoke(routing_prompt)
 
@@ -152,10 +159,6 @@ class SupervisorNode:
 
         # 意图标记：取第一个作为主意图
         primary_intent = agent_list[0] if agent_list else "knowledge_rag"
-        self.working_memory.update(session_id, {
-            "last_intent": primary_intent,
-            "routed_agents": agent_list,
-        })
 
         return {
             **state,
@@ -266,7 +269,6 @@ def continue_to_agents(state: AgentState) -> list[Send]:
 
 def create_supervisor_graph(
     llm: ChatOpenAI | None = None,
-    working_memory: WorkingMemory | None = None,
     short_term_memory: ShortTermMemory | None = None,
     retriever: HybridRetriever | None = None,
     knowledge_graph: KnowledgeGraph | None = None,
@@ -277,18 +279,15 @@ def create_supervisor_graph(
 
     Args:
         llm: 语言模型实例
-        working_memory: 工作记忆
-        short_term_memory: 短期记忆
+        short_term_memory: 短期记忆（对话历史）
         retriever: 混合检索引擎（替代 long_term_memory + sparse_index）
         knowledge_graph: 知识图谱
         enable_checkpointing: 是否启用检查点
     """
     if llm is None:
         llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    if working_memory is None:
-        working_memory = WorkingMemory()
 
-    supervisor = SupervisorNode(llm, working_memory)
+    supervisor = SupervisorNode(llm)
 
     # 实例化所有子 Agent
     intent_router = IntentRouterAgent(llm)

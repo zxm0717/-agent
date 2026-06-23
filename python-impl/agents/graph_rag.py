@@ -158,8 +158,9 @@ class GraphRAGAgent:
         query: str,
         graph_context: str,
         retrieval_results: list,
+        history_messages: list | None = None,
     ) -> str:
-        """结合图谱上下文和混合检索结果生成最终回答"""
+        """结合图谱上下文 + 混合检索结果 + 对话历史生成最终回答"""
         doc_text = ""
         if retrieval_results:
             parts = []
@@ -179,9 +180,22 @@ class GraphRAGAgent:
 
         combined_context = "\n\n".join(context_parts) if context_parts else "暂无相关知识库信息。"
 
+        # 构建对话历史（最近 3 轮，用于多轮理解）
+        history_text = ""
+        if history_messages:
+            from langchain_core.messages import HumanMessage
+            recent = history_messages[-6:]  # 最近 3 轮
+            if len(recent) > 1:
+                lines = []
+                for m in recent:
+                    role = "用户" if isinstance(m, HumanMessage) else "客服"
+                    lines.append(f"{role}: {m.content[:200]}")
+                history_text = "## 对话历史\n" + "\n".join(lines) + "\n\n"
+
         messages = [
             SystemMessage(content=GRAPH_RAG_SYSTEM_PROMPT),
             HumanMessage(content=(
+                f"{history_text}"
                 f"用户问题: {query}\n\n"
                 f"参考信息:\n{combined_context}"
             )),
@@ -237,13 +251,16 @@ class GraphRAGAgent:
     @trace_agent_call("graph_rag_process")
     async def process(self, state: dict[str, Any]) -> dict[str, Any]:
         """
-        作为 LangGraph 节点处理状态。
+        作为 LangGraph 节点处理状态（带对话历史上下文）。
         """
         messages = state.get("messages", [])
         if not messages:
             return state
 
         user_query = messages[-1].content if messages else ""
+
+        # 对话历史（不含当前消息，供生成阶段理解多轮上下文）
+        history = messages[:-1] if len(messages) > 1 else []
 
         # 运行混合检索
         retrieval_result = await self.hybrid_retrieve(user_query)
@@ -253,6 +270,7 @@ class GraphRAGAgent:
             query=user_query,
             graph_context=retrieval_result.get("graph_context", ""),
             retrieval_results=retrieval_result.get("retrieval_results", []),
+            history_messages=history,
         )
 
         return {

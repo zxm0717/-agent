@@ -1,4 +1,3 @@
-from memory.working_memory import WorkingMemory
 from memory.short_term import ShortTermMemory
 from memory.long_term import LongTermMemory, Chunk, SemanticChunker
 from memory.knowledge_graph import KnowledgeGraph
@@ -10,7 +9,6 @@ from memory.retriever import HybridRetriever, QueryAnalysis, RetrievalResult
 from memory.index_manifest import IndexManifest
 
 __all__ = [
-    "WorkingMemory",
     "ShortTermMemory",
     "LongTermMemory",
     "Chunk",
